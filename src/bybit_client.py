@@ -157,18 +157,22 @@ class BybitClient:
                 record_api_call(latency, success=True)
                 
                 return data.get("result", {})
-            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                # Timeouts spécifiques - retry avec backoff
                 last_error = e
                 if attempts >= max_attempts:
                     break
                 delay = backoff_base * (2 ** (attempts - 1)) + random.uniform(0, 0.25)
                 time.sleep(delay)
-            except (httpx.RequestError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-                # Erreurs réseau/HTTP spécifiques
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                # Autres erreurs réseau/HTTP - retry avec backoff
                 last_error = e
-                break
+                if attempts >= max_attempts:
+                    break
+                delay = backoff_base * (2 ** (attempts - 1)) + random.uniform(0, 0.25)
+                time.sleep(delay)
             except (ValueError, TypeError, KeyError) as e:
-                # Erreurs de données/parsing
+                # Erreurs de données/parsing - pas de retry
                 last_error = e
                 break
             except Exception as e:

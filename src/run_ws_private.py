@@ -35,7 +35,7 @@ class PrivateWSRunner:
     def run(self):
         self.logger.info("🚀 Démarrage WebSocket privée (runner)")
         self.logger.info(f"📂 Configuration chargée (testnet={self.testnet}, channels={self.channels})")
-        self.logger.info(f"🔑 Clé API: {'présente' if self.api_key else 'absente'}")
+        self.logger.info(f"🔑 Clé API: {'présente' if self.client.api_key else 'absente'}")
         self.client.run()
 
 
