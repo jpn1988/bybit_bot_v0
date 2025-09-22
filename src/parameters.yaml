@@ -14,7 +14,7 @@
 # ============================================
 
 categorie: "linear"      # "linear" | "inverse" | "both"
-funding_min: 0.0001     # ex: 0.0001 pour >= 0.01%  | null = pas de min
+funding_min: 0.0005     # ex: 0.0001 pour >= 0.01%  | null = pas de min
 funding_max: null        # ex: 0.0005 pour <= 0.05%  | null = pas de max
 volume_min: null     # ex: 1000000 pour >= 1M USDT | null = pas de min [ANCIEN]
 volume_min_millions: 50   # ex: 5.0 pour >= 5M USDT | null = pas de min [NOUVEAU]
@@ -26,3 +26,20 @@ volatility_ttl_sec: 120  # TTL du cache volatilité (secondes)
 limite: null               # ex: 10  | null = pas de limite
 funding_time_min_minutes:    # Optionnel: minimum 30 minutes avant funding
 funding_time_max_minutes: 1400  # Optionnel: maximum 120 minutes avant funding
+
+# ============================================
+# Configuration du classement des paires (FR)
+# - weight_funding : poids du funding dans le score (plus élevé = funding plus important)
+# - weight_volume : poids du volume dans le score (plus élevé = volume plus important)
+# - weight_spread : poids du spread dans le score (plus élevé = spread plus important)
+# - weight_volatility : poids de la volatilité dans le score (plus élevé = volatilité plus importante)
+# - top_n : nombre de meilleures paires à garder après classement
+# 
+# Formule: Score = (weight_funding × funding) + (weight_volume × log(volume)) - (weight_spread × spread) - (weight_volatility × volatility)
+# ============================================
+scoring:
+  weight_funding: 2000    # Poids du funding (défaut: 1000)
+  weight_volume: 3       # Poids du volume (défaut: 10)
+  weight_spread: 300      # Poids du spread (défaut: 200)
+  weight_volatility: 3000   # Poids de la volatilité (défaut: 50)
+  top_n: 3                # Nombre de meilleures paires à garder (défaut: 1)

@@ -87,6 +87,12 @@ class WatchlistManager:
             # Nouveaux paramètres temporels
             "funding_time_min_minutes": None,
             "funding_time_max_minutes": None,
+            # Configuration du classement des paires
+            "scoring": {
+                "weight_spread": 200,
+                "weight_volatility": 50,
+                "top_n": 1,
+            },
         }
         
         # Charger depuis le fichier si disponible
@@ -822,6 +828,10 @@ class WatchlistManager:
         else:
             n_after_volatility = 0
         
+        # Stocker les paires filtrées avant l'application de la limite finale
+        # (pour le classement par score)
+        self._filtered_candidates = final_symbols.copy()
+        
         # Appliquer la limite finale
         if limite is not None and len(final_symbols) > limite:
             final_symbols = final_symbols[:limite]
@@ -915,6 +925,15 @@ class WatchlistManager:
         self.logger.info(f"📊 Symboles linear: {len(linear_symbols)}, inverse: {len(inverse_symbols)}")
         
         return linear_symbols, inverse_symbols, funding_data
+    
+    def get_filtered_candidates(self) -> List[Tuple]:
+        """
+        Retourne les paires filtrées avant le classement par score.
+        
+        Returns:
+            Liste des paires filtrées sous forme de tuples
+        """
+        return getattr(self, '_filtered_candidates', [])
     
     def get_selected_symbols(self) -> List[str]:
         """
