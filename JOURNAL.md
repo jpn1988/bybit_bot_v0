@@ -47,7 +47,7 @@
 **But :** Créer un système complet de filtrage des contrats perpétuels par funding rate et volume, avec suivi des prix en temps réel.
 **Fichiers créés :** 
   - `src/instruments.py` - Récupération des instruments perpétuels
-  - `src/filtering.py` - Filtrage par critères (funding, volume)
+  - `src/filtering.py` - Filtrage par critères (funding, volume) [VESTIGIAL - non utilisé en production]
   - `src/price_store.py` - Stockage des prix en mémoire
   - `src/run_ws_prices.py` - Script principal de suivi des prix
   - `src/watchlist_config.fr.yaml` - Configuration en français

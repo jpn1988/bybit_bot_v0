@@ -1,4 +1,10 @@
-"""Module pour filtrer les contrats perpétuels et construire des watchlists."""
+"""
+Module pour filtrer les contrats perpétuels et construire des watchlists.
+
+NOTE: FilterCriteria et build_watchlist ne sont PAS utilisés dans le code de production.
+Ce module contient du code vestigial/expérimental conservé pour les tests futurs.
+Le code de production utilise maintenant WatchlistManager dans watchlist_manager.py.
+"""
 
 import re
 from dataclasses import dataclass

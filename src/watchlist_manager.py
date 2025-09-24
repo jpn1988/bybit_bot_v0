@@ -2,27 +2,28 @@
 """
 Gestionnaire de watchlist dédié pour le bot Bybit.
 
-Cette classe gère uniquement :
-- L'application des filtres (funding, volume, spread, volatilité, temps avant funding, etc.)
-- Le stockage de la liste des symboles retenus
-- Les fonctions utilitaires liées à la sélection et au tri des symboles
+Cette classe orchestre la construction de la watchlist :
+- Charge et valide la configuration
+- Coordonne la récupération de données (via WatchlistDataFetcher)
+- Applique les filtres (via WatchlistFilters)
+- Stocke et expose les résultats finaux
 """
 
 import os
-import time
 import yaml
-import httpx
-import asyncio
-from typing import List, Tuple, Dict, Optional
+import time
+import threading
+from typing import List, Tuple, Dict, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 from logging_setup import setup_logging
 from config import get_settings
 from bybit_client import BybitPublicClient
 from instruments import get_perp_symbols, category_of_symbol
-from http_utils import get_rate_limiter
-from http_client_manager import get_http_client
 from volatility_tracker import VolatilityTracker
 from metrics import record_filter_result
+from watchlist_data_fetcher import WatchlistDataFetcher
+from watchlist_filters import WatchlistFilters
+from constants.constants import LOG_EMOJIS, LOG_MESSAGES
 
 
 class WatchlistManager:
@@ -31,10 +32,9 @@ class WatchlistManager:
     
     Responsabilités :
     - Chargement et validation de la configuration
-    - Application des filtres successifs (funding, spread, volatilité)
-    - Récupération des données de marché (funding rates, spreads)
-    - Sélection et tri des symboles selon les critères
-    - Stockage de la watchlist finale
+    - Orchestration de la récupération de données (via WatchlistDataFetcher)
+    - Application des filtres (via WatchlistFilters)
+    - Stockage et exposition des résultats finaux
     """
     
     def __init__(self, testnet: bool = True, logger=None):
@@ -57,8 +57,20 @@ class WatchlistManager:
         self.funding_data = {}
         self.original_funding_data = {}
         
+        # Modules spécialisés
+        self.data_fetcher = WatchlistDataFetcher(self.logger)
+        self.filters = WatchlistFilters(self.logger)
+        
         # Client pour les données publiques
         self._client: Optional[BybitPublicClient] = None
+        
+        # Gestion du rafraîchissement périodique
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._refresh_running = False
+        self._refresh_callback: Optional[Callable] = None
+        self._base_url: Optional[str] = None
+        self._perp_data: Optional[Dict] = None
+        self._volatility_tracker: Optional[VolatilityTracker] = None
     
     def load_and_validate_config(self) -> Dict:
         """
@@ -87,6 +99,8 @@ class WatchlistManager:
             # Nouveaux paramètres temporels
             "funding_time_min_minutes": None,
             "funding_time_max_minutes": None,
+            # Paramètre de rafraîchissement périodique
+            "refresh_watchlist_interval": 0,
             # Configuration du classement des paires
             "scoring": {
                 "weight_spread": 200,
@@ -118,6 +132,7 @@ class WatchlistManager:
             "volatility_ttl_sec": "volatility_ttl_sec",
             "funding_time_min_minutes": "funding_time_min_minutes",
             "funding_time_max_minutes": "funding_time_max_minutes",
+            "refresh_watchlist_interval": "refresh_watchlist_interval",
         }
         
         # Appliquer les variables d'environnement si présentes
@@ -216,460 +231,27 @@ class WatchlistManager:
             if vol_ttl > 3600:
                 errors.append(f"volatility_ttl_sec trop élevé ({vol_ttl}), maximum: 3600 secondes (1h)")
         
+        # Validation de l'intervalle de rafraîchissement
+        refresh_interval = config.get("refresh_watchlist_interval")
+        if refresh_interval is not None:
+            if refresh_interval < 0:
+                errors.append(f"refresh_watchlist_interval ne peut pas être négatif ({refresh_interval})")
+            if refresh_interval > 0 and refresh_interval < 60:
+                errors.append(f"refresh_watchlist_interval trop faible ({refresh_interval}), minimum recommandé: 60 secondes")
+            if refresh_interval > 86400:  # 24 heures
+                errors.append(f"refresh_watchlist_interval trop élevé ({refresh_interval}), maximum: 86400 secondes (24h)")
+        
         # Lever une erreur si des problèmes ont été détectés
         if errors:
             error_msg = "Configuration invalide détectée:\n" + "\n".join(f"  - {error}" for error in errors)
             raise ValueError(error_msg)
     
-    def fetch_funding_map(self, base_url: str, category: str, timeout: int = 10) -> Dict[str, Dict]:
-        """
-        Récupère les taux de funding pour une catégorie donnée.
-        
-        Args:
-            base_url: URL de base de l'API Bybit
-            category: Catégorie (linear ou inverse)
-            timeout: Timeout pour les requêtes HTTP
-            
-        Returns:
-            Dict[str, Dict]: Dictionnaire {symbol: {funding, volume, next_funding_time}}
-            
-        Raises:
-            RuntimeError: En cas d'erreur HTTP ou API
-        """
-        funding_map = {}
-        cursor = ""
-        page_index = 0
-        
-        rate_limiter = get_rate_limiter()
-        while True:
-            # Construire l'URL avec pagination
-            url = f"{base_url}/v5/market/tickers"
-            params = {
-                "category": category,
-                "limit": 1000  # Limite maximum supportée par l'API Bybit
-            }
-            if cursor:
-                params["cursor"] = cursor
-                
-            try:
-                page_index += 1
-                # Respecter le rate limit avant chaque appel
-                rate_limiter.acquire()
-                client = get_http_client(timeout=timeout)
-                response = client.get(url, params=params)
-                
-                # Vérifier le statut HTTP
-                if response.status_code >= 400:
-                    raise RuntimeError(
-                        f"Erreur HTTP Bybit GET {url} | category={category} limit={params.get('limit')} "
-                        f"cursor={params.get('cursor', '-')} timeout={timeout}s page={page_index} "
-                        f"collected={len(funding_map)} | status={response.status_code} "
-                        f"detail=\"{response.text[:200]}\""
-                    )
-                
-                data = response.json()
-                
-                # Vérifier le retCode
-                if data.get("retCode") != 0:
-                    ret_code = data.get("retCode")
-                    ret_msg = data.get("retMsg", "")
-                    raise RuntimeError(
-                        f"Erreur API Bybit GET {url} | category={category} limit={params.get('limit')} "
-                        f"cursor={params.get('cursor', '-')} timeout={timeout}s page={page_index} "
-                        f"collected={len(funding_map)} | retCode={ret_code} retMsg=\"{ret_msg}\""
-                    )
-                
-                result = data.get("result", {})
-                tickers = result.get("list", [])
-                
-                # Extraire les funding rates, volumes et temps de funding
-                for ticker in tickers:
-                    symbol = ticker.get("symbol", "")
-                    funding_rate = ticker.get("fundingRate")
-                    volume_24h = ticker.get("volume24h")
-                    next_funding_time = ticker.get("nextFundingTime")
-                    
-                    if symbol and funding_rate is not None:
-                        try:
-                            funding_map[symbol] = {
-                                "funding": float(funding_rate),
-                                "volume": float(volume_24h) if volume_24h is not None else 0.0,
-                                "next_funding_time": next_funding_time
-                            }
-                        except (ValueError, TypeError):
-                            # Ignorer si les données ne sont pas convertibles en float
-                            pass
-                
-                # Vérifier s'il y a une page suivante
-                next_page_cursor = result.get("nextPageCursor")
-                if not next_page_cursor:
-                    break
-                cursor = next_page_cursor
-                    
-            except httpx.RequestError as e:
-                raise RuntimeError(
-                    f"Erreur réseau Bybit GET {url} | category={category} limit={params.get('limit')} "
-                    f"cursor={params.get('cursor', '-')} timeout={timeout}s page={page_index} "
-                    f"collected={len(funding_map)} | error={e}"
-                )
-            except Exception as e:
-                if "Erreur" in str(e):
-                    raise
-                else:
-                    raise RuntimeError(
-                        f"Erreur inconnue Bybit GET {url} | category={category} limit={params.get('limit')} "
-                        f"cursor={params.get('cursor', '-')} timeout={timeout}s page={page_index} "
-                        f"collected={len(funding_map)} | error={e}"
-                    )
-        
-        return funding_map
     
-    def fetch_spread_data(self, base_url: str, symbols: List[str], timeout: int = 10, category: str = "linear") -> Dict[str, float]:
-        """
-        Récupère les spreads via /v5/market/tickers paginé, puis filtre localement.
-        
-        Args:
-            base_url: URL de base de l'API Bybit
-            symbols: Liste cible des symboles à retourner
-            timeout: Timeout HTTP
-            category: "linear" ou "inverse"
-            
-        Returns:
-            Dict[str, float]: map {symbol: spread_pct}
-        """
-        wanted = set(symbols)
-        found: Dict[str, float] = {}
-        url = f"{base_url}/v5/market/tickers"
-        params = {"category": category, "limit": 1000}
-        cursor = ""
-        page_index = 0
-        rate_limiter = get_rate_limiter()
-        
-        while True:
-            page_index += 1
-            if cursor:
-                params["cursor"] = cursor
-            else:
-                params.pop("cursor", None)
-                
-            try:
-                rate_limiter.acquire()
-                client = get_http_client(timeout=timeout)
-                resp = client.get(url, params=params)
-                
-                if resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"Erreur HTTP Bybit GET {url} | category={category} page={page_index} "
-                        f"limit={params.get('limit')} cursor={params.get('cursor','-')} status={resp.status_code} "
-                        f"detail=\"{resp.text[:200]}\""
-                    )
-                
-                data = resp.json()
-                if data.get("retCode") != 0:
-                    raise RuntimeError(
-                        f"Erreur API Bybit GET {url} | category={category} page={page_index} "
-                        f"retCode={data.get('retCode')} retMsg=\"{data.get('retMsg','')}\""
-                    )
-                
-                result = data.get("result", {})
-                tickers = result.get("list", [])
-                
-                for t in tickers:
-                    sym = t.get("symbol")
-                    if sym in wanted:
-                        bid1 = t.get("bid1Price")
-                        ask1 = t.get("ask1Price")
-                        try:
-                            if bid1 is not None and ask1 is not None:
-                                b = float(bid1)
-                                a = float(ask1)
-                                if b > 0 and a > 0:
-                                    mid = (a + b) / 2
-                                    if mid > 0:
-                                        found[sym] = (a - b) / mid
-                        except (ValueError, TypeError):
-                            # Erreur de conversion numérique - ignorer silencieusement
-                            pass
-                
-                # Fin pagination
-                next_cursor = result.get("nextPageCursor")
-                # Arrêt anticipé si on a tout trouvé
-                if len(found) >= len(wanted):
-                    break
-                if not next_cursor:
-                    break
-                cursor = next_cursor
-                
-            except (httpx.RequestError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-                self.logger.error(
-                    f"Erreur réseau spread paginé page={page_index} category={category}: {type(e).__name__}: {e}"
-                )
-                break
-            except (ValueError, TypeError, KeyError) as e:
-                self.logger.warning(
-                    f"Erreur données spread paginé page={page_index} category={category}: {type(e).__name__}: {e}"
-                )
-                break
-            except Exception as e:
-                self.logger.error(
-                    f"Erreur inattendue spread paginé page={page_index} category={category}: {type(e).__name__}: {e}"
-                )
-                break
-        
-        # Fallback unitaire pour les symboles manquants
-        missing = [s for s in symbols if s not in found]
-        for s in missing:
-            try:
-                val = self._fetch_single_spread(base_url, s, timeout, category)
-                if val is not None:
-                    found[s] = val
-            except (httpx.RequestError, ValueError, TypeError):
-                # Erreurs réseau ou conversion - ignorer silencieusement pour le fallback
-                pass
-        
-        return found
     
-    def _fetch_single_spread(self, base_url: str, symbol: str, timeout: int, category: str) -> Optional[float]:
-        """
-        Récupère le spread pour un seul symbole.
-        
-        Args:
-            base_url: URL de base de l'API Bybit
-            symbol: Symbole à analyser
-            timeout: Timeout pour les requêtes HTTP
-            category: Catégorie des symboles ("linear" ou "inverse")
-            
-        Returns:
-            Spread en pourcentage ou None si erreur
-        """
-        try:
-            url = f"{base_url}/v5/market/tickers"
-            params = {"category": category, "symbol": symbol}
-            
-            rate_limiter = get_rate_limiter()
-            rate_limiter.acquire()
-            client = get_http_client(timeout=timeout)
-            response = client.get(url, params=params)
-            
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Erreur HTTP Bybit GET {url} | category={category} symbol={symbol} "
-                    f"timeout={timeout}s status={response.status_code} detail=\"{response.text[:200]}\""
-                )
-            
-            data = response.json()
-            
-            if data.get("retCode") != 0:
-                ret_code = data.get("retCode")
-                ret_msg = data.get("retMsg", "")
-                raise RuntimeError(
-                    f"Erreur API Bybit GET {url} | category={category} symbol={symbol} "
-                    f"timeout={timeout}s retCode={ret_code} retMsg=\"{ret_msg}\""
-                )
-            
-            result = data.get("result", {})
-            tickers = result.get("list", [])
-            
-            if not tickers:
-                return None
-            
-            ticker = tickers[0]
-            bid1_price = ticker.get("bid1Price")
-            ask1_price = ticker.get("ask1Price")
-            
-            if bid1_price is not None and ask1_price is not None:
-                try:
-                    bid1 = float(bid1_price)
-                    ask1 = float(ask1_price)
-                    
-                    if bid1 > 0 and ask1 > 0:
-                        spread_pct = (ask1 - bid1) / ((ask1 + bid1) / 2)
-                        return spread_pct
-                except (ValueError, TypeError, ZeroDivisionError):
-                    pass
-            
-            return None
-            
-        except Exception:
-            return None
     
-    def calculate_funding_time_remaining(self, next_funding_time) -> str:
-        """Retourne "Xh Ym Zs" à partir d'un timestamp Bybit (ms) ou ISO."""
-        if not next_funding_time:
-            return "-"
-        try:
-            import datetime
-            funding_dt = None
-            if isinstance(next_funding_time, (int, float)):
-                funding_dt = datetime.datetime.fromtimestamp(float(next_funding_time) / 1000, tz=datetime.timezone.utc)
-            elif isinstance(next_funding_time, str):
-                if next_funding_time.isdigit():
-                    funding_dt = datetime.datetime.fromtimestamp(float(next_funding_time) / 1000, tz=datetime.timezone.utc)
-                else:
-                    funding_dt = datetime.datetime.fromisoformat(next_funding_time.replace('Z', '+00:00'))
-                    if funding_dt.tzinfo is None:
-                        funding_dt = funding_dt.replace(tzinfo=datetime.timezone.utc)
-            if funding_dt is None:
-                return "-"
-            now = datetime.datetime.now(datetime.timezone.utc)
-            delta = (funding_dt - now).total_seconds()
-            if delta <= 0:
-                return "-"
-            total_seconds = int(delta)
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            if hours > 0:
-                return f"{hours}h {minutes}m {seconds}s"
-            if minutes > 0:
-                return f"{minutes}m {seconds}s"
-            return f"{seconds}s"
-        except Exception as e:
-            self.logger.error(f"Erreur calcul temps funding formaté: {type(e).__name__}: {e}")
-            return "-"
     
-    def calculate_funding_minutes_remaining(self, next_funding_time) -> Optional[float]:
-        """Retourne les minutes restantes avant le prochain funding (pour filtrage)."""
-        if not next_funding_time:
-            return None
-        try:
-            import datetime
-            funding_dt = None
-            if isinstance(next_funding_time, (int, float)):
-                funding_dt = datetime.datetime.fromtimestamp(float(next_funding_time) / 1000, tz=datetime.timezone.utc)
-            elif isinstance(next_funding_time, str):
-                if next_funding_time.isdigit():
-                    funding_dt = datetime.datetime.fromtimestamp(float(next_funding_time) / 1000, tz=datetime.timezone.utc)
-                else:
-                    funding_dt = datetime.datetime.fromisoformat(next_funding_time.replace('Z', '+00:00'))
-                    if funding_dt.tzinfo is None:
-                        funding_dt = funding_dt.replace(tzinfo=datetime.timezone.utc)
-            if funding_dt is None:
-                return None
-            now = datetime.datetime.now(datetime.timezone.utc)
-            delta_sec = (funding_dt - now).total_seconds()
-            if delta_sec <= 0:
-                return None
-            return delta_sec / 60.0  # Convertir en minutes
-        except Exception as e:
-            self.logger.error(f"Erreur calcul minutes funding: {type(e).__name__}: {e}")
-            return None
     
-    def filter_by_funding(
-        self, 
-        perp_data: Dict, 
-        funding_map: Dict, 
-        funding_min: Optional[float], 
-        funding_max: Optional[float], 
-        volume_min: Optional[float], 
-        volume_min_millions: Optional[float], 
-        limite: Optional[int], 
-        funding_time_min_minutes: Optional[int] = None, 
-        funding_time_max_minutes: Optional[int] = None
-    ) -> List[Tuple[str, float, float, str]]:
-        """
-        Filtre les symboles par funding, volume et fenêtre temporelle avant funding.
-        
-        Args:
-            perp_data: Données des perpétuels (linear, inverse, total)
-            funding_map: Dictionnaire des funding rates, volumes et temps de funding
-            funding_min: Funding minimum en valeur absolue
-            funding_max: Funding maximum en valeur absolue
-            volume_min: Volume minimum (ancien format)
-            volume_min_millions: Volume minimum en millions (nouveau format)
-            limite: Limite du nombre d'éléments
-            funding_time_min_minutes: Temps minimum en minutes avant prochain funding
-            funding_time_max_minutes: Temps maximum en minutes avant prochain funding
-            
-        Returns:
-            Liste des (symbol, funding, volume, funding_time_remaining) triés
-        """
-        # Récupérer tous les symboles perpétuels
-        all_symbols = list(set(perp_data["linear"] + perp_data["inverse"]))
-        
-        # Déterminer le volume minimum à utiliser (priorité : volume_min_millions > volume_min)
-        effective_volume_min = None
-        if volume_min_millions is not None:
-            effective_volume_min = volume_min_millions * 1_000_000  # Convertir en valeur brute
-        elif volume_min is not None:
-            effective_volume_min = volume_min
-        
-        # Filtrer par funding, volume et fenêtre temporelle
-        filtered_symbols = []
-        for symbol in all_symbols:
-            if symbol in funding_map:
-                data = funding_map[symbol]
-                funding = data["funding"]
-                volume = data["volume"]
-                next_funding_time = data.get("next_funding_time")
-                
-                # Appliquer les bornes funding/volume (utiliser valeur absolue pour funding)
-                if funding_min is not None and abs(funding) < funding_min:
-                    continue
-                if funding_max is not None and abs(funding) > funding_max:
-                    continue
-                if effective_volume_min is not None and volume < effective_volume_min:
-                    continue
-                
-                # Appliquer le filtre temporel si demandé
-                if funding_time_min_minutes is not None or funding_time_max_minutes is not None:
-                    # Utiliser la fonction centralisée pour calculer les minutes restantes
-                    minutes_remaining = self.calculate_funding_minutes_remaining(next_funding_time)
-                    
-                    # Si pas de temps valide alors qu'on filtre, rejeter
-                    if minutes_remaining is None:
-                        continue
-                    if (funding_time_min_minutes is not None and 
-                        minutes_remaining < float(funding_time_min_minutes)):
-                        continue
-                    if (funding_time_max_minutes is not None and 
-                        minutes_remaining > float(funding_time_max_minutes)):
-                        continue
-                
-                # Calculer le temps restant avant le prochain funding (formaté)
-                funding_time_remaining = self.calculate_funding_time_remaining(next_funding_time)
-                
-                filtered_symbols.append((symbol, funding, volume, funding_time_remaining))
-        
-        # Trier par |funding| décroissant
-        filtered_symbols.sort(key=lambda x: abs(x[1]), reverse=True)
-        
-        # Appliquer la limite
-        if limite is not None:
-            filtered_symbols = filtered_symbols[:limite]
-        
-        return filtered_symbols
     
-    def filter_by_spread(
-        self, 
-        symbols_data: List[Tuple[str, float, float, str]], 
-        spread_data: Dict[str, float], 
-        spread_max: Optional[float]
-    ) -> List[Tuple[str, float, float, str, float]]:
-        """
-        Filtre les symboles par spread maximum.
-        
-        Args:
-            symbols_data: Liste des (symbol, funding, volume, funding_time_remaining)
-            spread_data: Dictionnaire des spreads {symbol: spread_pct}
-            spread_max: Spread maximum autorisé
-            
-        Returns:
-            Liste des (symbol, funding, volume, funding_time_remaining, spread_pct) filtrés
-        """
-        if spread_max is None:
-            # Pas de filtre de spread, ajouter 0.0 comme spread par défaut
-            return [(symbol, funding, volume, funding_time_remaining, 0.0) 
-                    for symbol, funding, volume, funding_time_remaining in symbols_data]
-        
-        filtered_symbols = []
-        for symbol, funding, volume, funding_time_remaining in symbols_data:
-            if symbol in spread_data:
-                spread_pct = spread_data[symbol]
-                if spread_pct <= spread_max:
-                    filtered_symbols.append((symbol, funding, volume, funding_time_remaining, spread_pct))
-        
-        return filtered_symbols
     
     def build_watchlist(
         self,
@@ -706,18 +288,18 @@ class WatchlistManager:
         # Récupérer les funding rates selon la catégorie
         funding_map = {}
         if categorie == "linear":
-            self.logger.info("📡 Récupération des funding rates pour linear (optimisé)…")
-            funding_map = self.fetch_funding_map(base_url, "linear", 10)
+            self.logger.info(f"{LOG_EMOJIS['api']} {LOG_MESSAGES['funding_rates_linear']}")
+            funding_map = self.data_fetcher.fetch_funding_map(base_url, "linear", 10)
         elif categorie == "inverse":
-            self.logger.info("📡 Récupération des funding rates pour inverse (optimisé)…")
-            funding_map = self.fetch_funding_map(base_url, "inverse", 10)
+            self.logger.info(f"{LOG_EMOJIS['api']} {LOG_MESSAGES['funding_rates_inverse']}")
+            funding_map = self.data_fetcher.fetch_funding_map(base_url, "inverse", 10)
         else:  # "both"
-            self.logger.info("📡 Récupération des funding rates pour linear+inverse (optimisé: parallèle)…")
+            self.logger.info(f"{LOG_EMOJIS['api']} {LOG_MESSAGES['funding_rates_both']}")
             # Paralléliser les requêtes linear et inverse
             with ThreadPoolExecutor(max_workers=2) as executor:
                 # Lancer les deux requêtes en parallèle
-                linear_future = executor.submit(self.fetch_funding_map, base_url, "linear", 10)
-                inverse_future = executor.submit(self.fetch_funding_map, base_url, "inverse", 10)
+                linear_future = executor.submit(self.data_fetcher.fetch_funding_map, base_url, "linear", 10)
+                inverse_future = executor.submit(self.data_fetcher.fetch_funding_map, base_url, "inverse", 10)
                 
                 # Attendre les résultats
                 linear_funding = linear_future.result()
@@ -726,7 +308,7 @@ class WatchlistManager:
             funding_map = {**linear_funding, **inverse_funding}  # Merger (priorité au dernier)
         
         if not funding_map:
-            self.logger.warning("⚠️ Aucun funding disponible pour la catégorie sélectionnée")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['no_funding_available']}")
             raise RuntimeError("Aucun funding disponible pour la catégorie sélectionnée")
         
         # Stocker les next_funding_time originaux pour fallback (REST)
@@ -744,7 +326,7 @@ class WatchlistManager:
         n0 = len([s for s in all_symbols if s in funding_map])
         
         # Filtrer par funding, volume et temps avant funding
-        filtered_symbols = self.filter_by_funding(
+        filtered_symbols = self.filters.filter_by_funding(
             perp_data,
             funding_map,
             funding_min,
@@ -764,7 +346,7 @@ class WatchlistManager:
         if spread_max is not None and filtered_symbols:
             # Récupérer les données de spread pour les symboles restants
             symbols_to_check = [symbol for symbol, _, _, _ in filtered_symbols]
-            self.logger.info(f"🔎 Évaluation du spread (REST tickers) pour {len(symbols_to_check)} symboles…")
+            self.logger.info(f"{LOG_EMOJIS['search']} {LOG_MESSAGES['spread_evaluation'].format(count=len(symbols_to_check))}")
             
             try:
                 spread_data = {}
@@ -775,17 +357,17 @@ class WatchlistManager:
                 
                 # Paralléliser les requêtes de spreads pour linear et inverse
                 if linear_symbols_for_spread or inverse_symbols_for_spread:
-                    self.logger.info(f"🔎 Récupération spreads (optimisé: batch=200, parallèle) - linear: {len(linear_symbols_for_spread)}, inverse: {len(inverse_symbols_for_spread)}…")
+                    self.logger.info(f"{LOG_EMOJIS['search']} {LOG_MESSAGES['spread_retrieval'].format(linear_count=len(linear_symbols_for_spread), inverse_count=len(inverse_symbols_for_spread))}")
                     
                     with ThreadPoolExecutor(max_workers=2) as executor:
                         futures = {}
                         
                         # Lancer les requêtes en parallèle si nécessaire
                         if linear_symbols_for_spread:
-                            futures['linear'] = executor.submit(self.fetch_spread_data, base_url, linear_symbols_for_spread, 10, "linear")
+                            futures['linear'] = executor.submit(self.data_fetcher.fetch_spread_data, base_url, linear_symbols_for_spread, 10, "linear")
                         
                         if inverse_symbols_for_spread:
-                            futures['inverse'] = executor.submit(self.fetch_spread_data, base_url, inverse_symbols_for_spread, 10, "inverse")
+                            futures['inverse'] = executor.submit(self.data_fetcher.fetch_spread_data, base_url, inverse_symbols_for_spread, 10, "inverse")
                         
                         # Récupérer les résultats
                         if 'linear' in futures:
@@ -796,16 +378,16 @@ class WatchlistManager:
                             inverse_spread_data = futures['inverse'].result()
                             spread_data.update(inverse_spread_data)
                 
-                final_symbols = self.filter_by_spread(filtered_symbols, spread_data, spread_max)
+                final_symbols = self.filters.filter_by_spread(filtered_symbols, spread_data, spread_max)
                 n2 = len(final_symbols)
                 
                 # Log des résultats du filtre spread
                 rejected = n1 - n2
                 spread_pct_display = spread_max * 100
-                self.logger.info(f"✅ Filtre spread : gardés={n2} | rejetés={rejected} (seuil {spread_pct_display:.2f}%)")
+                self.logger.info(f"{LOG_EMOJIS['ok']} {LOG_MESSAGES['spread_filter_success'].format(kept=n2, rejected=rejected, threshold=spread_pct_display)}")
                 
             except Exception as e:
-                self.logger.warning(f"⚠️ Erreur lors de la récupération des spreads : {e}")
+                self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['spread_filter_error'].format(error=e)}")
                 # Continuer sans le filtre de spread
                 final_symbols = [(symbol, funding, volume, funding_time_remaining, 0.0) 
                                for symbol, funding, volume, funding_time_remaining in filtered_symbols]
@@ -814,15 +396,16 @@ class WatchlistManager:
         n_before_volatility = len(final_symbols) if final_symbols else 0
         if final_symbols:
             try:
-                self.logger.info("🔎 Évaluation de la volatilité 5m pour tous les symboles…")
-                final_symbols = volatility_tracker.filter_by_volatility(
+                self.logger.info(f"{LOG_EMOJIS['search']} {LOG_MESSAGES['volatility_evaluation']}")
+                final_symbols = self.filters.apply_volatility_filter(
                     final_symbols,
+                    volatility_tracker,
                     volatility_min,
                     volatility_max
                 )
                 n_after_volatility = len(final_symbols)
             except Exception as e:
-                self.logger.warning(f"⚠️ Erreur lors du calcul de la volatilité : {e}")
+                self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['volatility_filter_error'].format(error=e)}")
                 n_after_volatility = n_before_volatility
                 # Continuer sans le filtre de volatilité
         else:
@@ -845,84 +428,29 @@ class WatchlistManager:
         record_filter_result("final_limit", n3, n_after_volatility - n3)
         
         # Log des comptes
-        self.logger.info(f"🧮 Comptes | avant filtres = {n0} | après funding/volume/temps = {n1} | après spread = {n2} | après volatilité = {n_after_volatility} | après tri+limit = {n3}")
+        self.logger.info(f"{LOG_EMOJIS['count']} {LOG_MESSAGES['filter_counts'].format(before=n0, after_funding=n1, after_spread=n2, after_volatility=n_after_volatility, final=n3)}")
         
         if not final_symbols:
-            self.logger.warning("⚠️ Aucun symbole ne correspond aux critères de filtrage")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['no_symbols_match_criteria']}")
             raise RuntimeError("Aucun symbole ne correspond aux critères de filtrage")
         
         # Séparer les symboles par catégorie
-        if len(final_symbols[0]) == 6:
-            linear_symbols = [
-                symbol for symbol, _, _, _, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "linear"
-            ]
-            inverse_symbols = [
-                symbol for symbol, _, _, _, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "inverse"
-            ]
-        elif len(final_symbols[0]) == 5:
-            linear_symbols = [
-                symbol for symbol, _, _, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "linear"
-            ]
-            inverse_symbols = [
-                symbol for symbol, _, _, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "inverse"
-            ]
-        elif len(final_symbols[0]) == 4:
-            linear_symbols = [
-                symbol for symbol, _, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "linear"
-            ]
-            inverse_symbols = [
-                symbol for symbol, _, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "inverse"
-            ]
-        else:
-            linear_symbols = [
-                symbol for symbol, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "linear"
-            ]
-            inverse_symbols = [
-                symbol for symbol, _, _ in final_symbols 
-                if category_of_symbol(symbol, self.symbol_categories) == "inverse"
-            ]
+        linear_symbols, inverse_symbols = self.filters.separate_symbols_by_category(
+            final_symbols, self.symbol_categories
+        )
         
         # Construire funding_data avec les bonnes données
-        funding_data = {}
-        if len(final_symbols[0]) == 6:
-            # Format: (symbol, funding, volume, funding_time_remaining, spread_pct, volatility_pct)
-            funding_data = {
-                symbol: (funding, volume, funding_time_remaining, spread_pct, volatility_pct) 
-                for symbol, funding, volume, funding_time_remaining, spread_pct, volatility_pct in final_symbols
-            }
-        elif len(final_symbols[0]) == 5:
-            # Format: (symbol, funding, volume, funding_time_remaining, spread_pct)
-            funding_data = {
-                symbol: (funding, volume, funding_time_remaining, spread_pct, None) 
-                for symbol, funding, volume, funding_time_remaining, spread_pct in final_symbols
-            }
-        elif len(final_symbols[0]) == 4:
-            # Format: (symbol, funding, volume, funding_time_remaining)
-            funding_data = {
-                symbol: (funding, volume, funding_time_remaining, 0.0, None) 
-                for symbol, funding, volume, funding_time_remaining in final_symbols
-            }
-        else:
-            # Format: (symbol, funding, volume)
-            funding_data = {
-                symbol: (funding, volume, "-", 0.0, None) 
-                for symbol, funding, volume in final_symbols
-            }
+        funding_data = self.filters.build_funding_data_dict(final_symbols)
         
         # Stocker les résultats
         self.selected_symbols = list(funding_data.keys())
         self.funding_data = funding_data
+        self.linear_symbols = linear_symbols
+        self.inverse_symbols = inverse_symbols
         
         # Log des symboles retenus
-        self.logger.info(f"🧭 Symboles retenus (Top {n3}) : {self.selected_symbols}")
-        self.logger.info(f"📊 Symboles linear: {len(linear_symbols)}, inverse: {len(inverse_symbols)}")
+        self.logger.info(f"{LOG_EMOJIS['watchlist']} {LOG_MESSAGES['symbols_retained'].format(count=n3, symbols=self.selected_symbols)}")
+        self.logger.info(f"{LOG_EMOJIS['data']} {LOG_MESSAGES['symbols_linear_inverse'].format(linear_count=len(linear_symbols), inverse_count=len(inverse_symbols))}")
         
         return linear_symbols, inverse_symbols, funding_data
     
@@ -961,3 +489,139 @@ class WatchlistManager:
             Dictionnaire des next_funding_time originaux
         """
         return self.original_funding_data.copy()
+    
+    def calculate_funding_time_remaining(self, next_funding_time) -> str:
+        """
+        Retourne "Xh Ym Zs" à partir d'un timestamp Bybit (ms) ou ISO.
+        Méthode exposée pour utilisation externe.
+        
+        Args:
+            next_funding_time: Timestamp du prochain funding
+            
+        Returns:
+            String formatée du temps restant ou "-" si erreur
+        """
+        return self.filters.calculate_funding_time_remaining(next_funding_time)
+    
+    def set_refresh_callback(self, callback: Callable[[List[str], List[str], Dict], None]):
+        """
+        Définit le callback à appeler lors du rafraîchissement de la watchlist.
+        
+        Args:
+            callback: Fonction à appeler avec (linear_symbols, inverse_symbols, funding_data)
+        """
+        self._refresh_callback = callback
+    
+    def start_periodic_refresh(self, base_url: str, perp_data: Dict, volatility_tracker: VolatilityTracker):
+        """
+        Démarre le rafraîchissement périodique de la watchlist si configuré.
+        
+        Args:
+            base_url: URL de base de l'API Bybit
+            perp_data: Données des perpétuels
+            volatility_tracker: Tracker de volatilité
+        """
+        refresh_interval = self.config.get("refresh_watchlist_interval", 0)
+        
+        if refresh_interval <= 0:
+            self.logger.info(f"🔄 Rafraîchissement périodique désactivé (refresh_watchlist_interval={refresh_interval})")
+            return
+        
+        if self._refresh_running:
+            self.logger.warning("⚠️ Rafraîchissement périodique déjà en cours")
+            return
+        
+        # Stocker les paramètres nécessaires
+        self._base_url = base_url
+        self._perp_data = perp_data
+        self._volatility_tracker = volatility_tracker
+        
+        # Démarrer le thread de rafraîchissement
+        self._refresh_running = True
+        self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+        self._refresh_thread.start()
+        
+        self.logger.info(f"🔄 Rafraîchissement périodique de la watchlist activé (interval: {refresh_interval}s)")
+    
+    def stop_periodic_refresh(self):
+        """
+        Arrête le rafraîchissement périodique de la watchlist.
+        """
+        if not self._refresh_running:
+            return
+        
+        self.logger.info("🧹 Arrêt du rafraîchissement périodique de la watchlist...")
+        self._refresh_running = False
+        
+        if self._refresh_thread and self._refresh_thread.is_alive():
+            self._refresh_thread.join(timeout=5)
+        
+        self._refresh_thread = None
+        self.logger.info("✅ Rafraîchissement périodique arrêté")
+    
+    def _refresh_loop(self):
+        """
+        Boucle principale du rafraîchissement périodique.
+        """
+        refresh_interval = self.config.get("refresh_watchlist_interval", 0)
+        
+        while self._refresh_running:
+            try:
+                # Attendre l'intervalle configuré
+                for _ in range(refresh_interval):
+                    if not self._refresh_running:
+                        return
+                    time.sleep(1)
+                
+                if not self._refresh_running:
+                    return
+                
+                # Effectuer le rafraîchissement
+                self._perform_refresh()
+                
+            except Exception as e:
+                self.logger.error(f"❌ Erreur dans la boucle de rafraîchissement: {e}")
+                # Continuer la boucle même en cas d'erreur
+    
+    def _perform_refresh(self):
+        """
+        Effectue le rafraîchissement de la watchlist.
+        """
+        try:
+            self.logger.info(f"🔄 Rafraîchissement périodique de la watchlist (config interval: {self.config.get('refresh_watchlist_interval', 0)}s)")
+            
+            # Sauvegarder l'ancienne watchlist
+            old_linear_symbols = self.linear_symbols.copy() if hasattr(self, 'linear_symbols') else []
+            old_inverse_symbols = self.inverse_symbols.copy() if hasattr(self, 'inverse_symbols') else []
+            old_selected_symbols = self.selected_symbols.copy()
+            
+            # Reconstruire la watchlist
+            new_linear_symbols, new_inverse_symbols, new_funding_data = self.build_watchlist(
+                self._base_url, self._perp_data, self._volatility_tracker
+            )
+            
+            # Comparer les listes
+            old_all_symbols = set(old_linear_symbols + old_inverse_symbols)
+            new_all_symbols = set(new_linear_symbols + new_inverse_symbols)
+            
+            if old_all_symbols != new_all_symbols:
+                # Changements détectés
+                removed_symbols = old_all_symbols - new_all_symbols
+                added_symbols = new_all_symbols - old_all_symbols
+                
+                if removed_symbols or added_symbols:
+                    self.logger.warning(f"⚠️ Paires remplacées : {', '.join(sorted(removed_symbols))} -> {', '.join(sorted(added_symbols))}")
+                
+                # Appeler le callback si défini
+                if self._refresh_callback:
+                    try:
+                        self._refresh_callback(new_linear_symbols, new_inverse_symbols, new_funding_data)
+                    except Exception as e:
+                        self.logger.error(f"❌ Erreur dans le callback de rafraîchissement: {e}")
+                
+                self.logger.info(f"✅ Watchlist mise à jour avec {len(new_all_symbols)} paires")
+            else:
+                self.logger.info("✅ Watchlist inchangée")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors du rafraîchissement de la watchlist: {e}")

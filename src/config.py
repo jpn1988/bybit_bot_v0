@@ -21,6 +21,7 @@ def get_settings():
         "SPREAD_MAX", "VOLUME_MIN_MILLIONS", "VOLATILITY_MIN", "VOLATILITY_MAX",
         "FUNDING_MIN", "FUNDING_MAX", "CATEGORY", "LIMIT", "VOLATILITY_TTL_SEC",
         "FUNDING_TIME_MIN_MINUTES", "FUNDING_TIME_MAX_MINUTES", "WS_PRIV_CHANNELS",
+        "REFRESH_WATCHLIST_INTERVAL",
         # Variables de rate limiting public (utilisées par volatility.get_async_rate_limiter)
         "PUBLIC_HTTP_MAX_CALLS_PER_SEC", "PUBLIC_HTTP_WINDOW_SECONDS",
     }
@@ -84,6 +85,8 @@ def get_settings():
     # Nouveaux paramètres de filtre temporel funding
     funding_time_min_minutes = os.getenv("FUNDING_TIME_MIN_MINUTES")
     funding_time_max_minutes = os.getenv("FUNDING_TIME_MAX_MINUTES")
+    # Paramètre de rafraîchissement périodique de la watchlist
+    refresh_watchlist_interval = os.getenv("REFRESH_WATCHLIST_INTERVAL")
     
     
     # Convertir en float/int si présentes, sinon None (avec gestion d'erreur)
@@ -110,6 +113,8 @@ def get_settings():
     # Conversions minutes → int
     funding_time_min_minutes = safe_int(funding_time_min_minutes)
     funding_time_max_minutes = safe_int(funding_time_max_minutes)
+    # Conversion refresh_watchlist_interval → int
+    refresh_watchlist_interval = safe_int(refresh_watchlist_interval)
     
     return {
         "testnet": os.getenv("TESTNET", "true").lower() == "true",
@@ -130,4 +135,6 @@ def get_settings():
         # Nouveaux paramètres temporels
         "funding_time_min_minutes": funding_time_min_minutes,
         "funding_time_max_minutes": funding_time_max_minutes,
+        # Paramètre de rafraîchissement périodique
+        "refresh_watchlist_interval": refresh_watchlist_interval,
     }

@@ -110,7 +110,7 @@ REXUSDT  |     +0.4951% |      121.9 |    +0.050% |     +0.320% |          45m
 
 ### Scripts principaux
 - `src/bot.py` - **ORCHESTRATEUR PRINCIPAL** : Watchlist (REST) + suivi temps réel (WS)
-- `src/app.py` - Orchestrateur supervision (REST + WS public + WS privé)
+- `src/app.py` - Orchestrateur supervision (REST + WS public + WS privé) [DEBUG/SUPERVISION ONLY]
 - `src/main.py` - Point d'entrée privé (lecture du solde)
 
 ### Modules de base
@@ -120,9 +120,10 @@ REXUSDT  |     +0.4951% |      121.9 |    +0.050% |     +0.320% |          45m
 
 ### Modules de watchlist
 - `src/instruments.py` - Récupération des instruments perpétuels (pagination 1000)
-- `src/filtering.py` - Filtrage funding/volume/fenêtre avant funding + tri
+- `src/watchlist_manager.py` - Gestionnaire principal de watchlist avec filtrage et scoring
 - `src/volatility.py` - Calcul de volatilité 5 minutes (async, semaphore=5)
 - `src/price_store.py` - Stockage des prix en mémoire
+- `src/filtering.py` - Code vestigial/expérimental (non utilisé en production)
 - `src/parameters.yaml` - Configuration des paramètres
 
 ### Scripts de test
@@ -138,7 +139,7 @@ REXUSDT  |     +0.4951% |      121.9 |    +0.050% |     +0.320% |          45m
 
 ## 🎯 Commandes utiles
 - **Orchestrateur principal (watchlist + WS)** : `python src/bot.py`
-- **Orchestrateur supervision (REST/WS public/privé)** : `python src/app.py`
+- **Orchestrateur supervision (REST/WS public/privé)** : `python src/app.py` [DEBUG/SUPERVISION ONLY]
 - **REST privé (solde)** : `python src/main.py`
 - **WS publique (test)** : `python src/run_ws_public.py`
 - **WS privée (test)** : `python src/run_ws_private.py`

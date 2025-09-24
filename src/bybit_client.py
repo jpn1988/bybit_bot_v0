@@ -8,6 +8,7 @@ import random
 from config import get_settings
 from metrics import record_api_call
 from http_client_manager import get_http_client
+from constants.constants import BYBIT_ERROR_MESSAGES, DEFAULT_RECV_WINDOW, MAX_RETRY_ATTEMPTS, BACKOFF_BASE
 
 
 class BybitClient:
@@ -65,7 +66,7 @@ class BybitClient:
             
         # Générer timestamp et recv_window
         timestamp = int(time.time() * 1000)
-        recv_window_ms = 10000
+        recv_window_ms = DEFAULT_RECV_WINDOW
         
         # Créer la query string triée
         query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
@@ -96,8 +97,8 @@ class BybitClient:
             url += f"?{query_string}"
         
         attempts = 0
-        max_attempts = 4
-        backoff_base = 0.5
+        max_attempts = MAX_RETRY_ATTEMPTS
+        backoff_base = BACKOFF_BASE
         last_error: Exception | None = None
         start_time = time.time()
         
@@ -130,15 +131,11 @@ class BybitClient:
                     ret_code = data.get("retCode")
                     ret_msg = data.get("retMsg", "")
                     if ret_code in [10005, 10006]:
-                        raise RuntimeError(
-                            "Authentification échouée : clé/secret invalides ou signature incorrecte"
-                        )
+                        raise RuntimeError(BYBIT_ERROR_MESSAGES[10005])
                     elif ret_code == 10018:
-                        raise RuntimeError("Accès refusé : IP non autorisée (whitelist requise dans Bybit)")
+                        raise RuntimeError(BYBIT_ERROR_MESSAGES[10018])
                     elif ret_code == 10017:
-                        raise RuntimeError(
-                            "Horodatage invalide : horloge locale désynchronisée (corrige l'heure système)"
-                        )
+                        raise RuntimeError(BYBIT_ERROR_MESSAGES[10017])
                     elif ret_code == 10016:
                         # Rate limit: backoff + jitter puis retry
                         retry_after = response.headers.get("Retry-After")
@@ -148,7 +145,7 @@ class BybitClient:
                         time.sleep(delay)
                         if attempts < max_attempts:
                             continue
-                        raise RuntimeError("Limite de requêtes atteinte : ralentis ou réessaie plus tard")
+                        raise RuntimeError(BYBIT_ERROR_MESSAGES[10016])
                     else:
                         raise RuntimeError(f"Erreur API Bybit : retCode={ret_code} retMsg=\"{ret_msg}\"")
                 

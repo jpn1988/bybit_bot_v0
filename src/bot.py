@@ -31,8 +31,10 @@ from watchlist_manager import WatchlistManager
 from ws_manager import WebSocketManager
 from scoring import ScoringEngine
 from errors import NoSymbolsError
+from constants.constants import LOG_EMOJIS, LOG_MESSAGES
 from metrics_monitor import start_metrics_monitoring
 from http_client_manager import close_all_http_clients
+from utils import compute_spread_with_mid_price, merge_symbol_data
 
 
 class PriceTracker:
@@ -68,6 +70,8 @@ class PriceTracker:
         
         # Gestionnaire de watchlist dédié
         self.watchlist_manager = WatchlistManager(testnet=self.testnet, logger=self.logger)
+        # Configurer le callback pour les changements de watchlist
+        self.watchlist_manager.set_refresh_callback(self._on_watchlist_refresh)
         
         # Moteur de scoring (sera initialisé avec la config)
         self.scoring_engine = None
@@ -78,15 +82,15 @@ class PriceTracker:
         # Configuration du signal handler pour Ctrl+C
         signal.signal(signal.SIGINT, self._signal_handler)
         
-        self.logger.info("🚀 Orchestrateur du bot (filters + WebSocket prix)")
-        self.logger.info("📂 Configuration chargée")
+        self.logger.info(f"{LOG_EMOJIS['start']} Orchestrateur du bot (filters + WebSocket prix)")
+        self.logger.info(f"{LOG_EMOJIS['config']} {LOG_MESSAGES['config_loaded']}")
         
         # Démarrer le monitoring des métriques
         start_metrics_monitoring(interval_minutes=5)
     
     def _signal_handler(self, signum, frame):
         """Gestionnaire de signal pour Ctrl+C."""
-        self.logger.info("🧹 Arrêt demandé, fermeture de la WebSocket…")
+        self.logger.info(f"{LOG_EMOJIS['stop']} Arrêt demandé, fermeture de la WebSocket…")
         self.running = False
         # Arrêter le gestionnaire WebSocket
         try:
@@ -98,7 +102,41 @@ class PriceTracker:
             self.volatility_tracker.stop_refresh_task()
         except Exception:
             pass
+        # Arrêter le rafraîchissement périodique de la watchlist
+        try:
+            self.watchlist_manager.stop_periodic_refresh()
+        except Exception:
+            pass
+        # Arrêter le monitoring des métriques
+        try:
+            from metrics_monitor import stop_metrics_monitoring
+            stop_metrics_monitoring()
+        except Exception:
+            pass
         return
+    
+    def get_price(self, symbol: str) -> dict:
+        """
+        Récupère les données de prix d'un symbole de manière sécurisée.
+        
+        Args:
+            symbol (str): Le symbole à récupérer
+            
+        Returns:
+            dict: Les données de prix du symbole ou un dictionnaire vide
+        """
+        with self._realtime_lock:
+            return self.realtime_data.get(symbol, {}).copy()
+    
+    def get_all_prices(self) -> dict:
+        """
+        Récupère une copie de toutes les données de prix de manière sécurisée.
+        
+        Returns:
+            dict: Une copie de toutes les données realtime_data
+        """
+        with self._realtime_lock:
+            return {symbol: data.copy() for symbol, data in self.realtime_data.items()}
     
     def _update_realtime_data_from_ticker(self, ticker_data: dict):
         """
@@ -136,17 +174,19 @@ class PriceTracker:
                     merged['timestamp'] = now_ts
                     self.realtime_data[symbol] = merged
         except Exception as e:
-            self.logger.warning(f"⚠️ Erreur mise à jour données temps réel pour {symbol}: {e}")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} Erreur mise à jour données temps réel pour {symbol}: {e}")
     
     def _recalculate_funding_time(self, symbol: str) -> str:
         """Retourne le temps restant basé uniquement sur nextFundingTime (WS puis REST)."""
         try:
-            with self._realtime_lock:
-                realtime_info = self.realtime_data.get(symbol, {})
+            realtime_info = self.get_price(symbol)
             ws_ts = realtime_info.get('next_funding_time')
             if ws_ts:
                 return self.watchlist_manager.calculate_funding_time_remaining(ws_ts)
-            rest_ts = self.original_funding_data.get(symbol)
+            
+            # Utiliser les données originales du WatchlistManager
+            original_funding_data = self.watchlist_manager.get_original_funding_data()
+            rest_ts = original_funding_data.get(symbol)
             if rest_ts:
                 return self.watchlist_manager.calculate_funding_time_remaining(rest_ts)
             return "-"
@@ -167,7 +207,7 @@ class PriceTracker:
                 updated_candidates = self._update_candidates_with_realtime_data(filtered_candidates)
                 
                 # Appliquer le classement par score avec les données actuelles
-                self.logger.info("🔄 Rafraîchissement du classement par score...")
+                self.logger.info(f"{LOG_EMOJIS['refresh']} {LOG_MESSAGES['scoring_refresh']}")
                 top_candidates = self.scoring_engine.rank_candidates(updated_candidates)
                 
                 # Extraire les symboles de la nouvelle sélection
@@ -179,15 +219,15 @@ class PriceTracker:
                         # Changement détecté
                         old_symbols_str = ", ".join(self.previous_top_symbols)
                         new_symbols_str = ", ".join(new_top_symbols)
-                        self.logger.warning(f"⚠️ Nouveau top détecté :")
+                        self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['new_top_detected']}")
                         self.logger.warning(f"   Ancien : {old_symbols_str}")
                         self.logger.warning(f"   Nouveau : {new_symbols_str}")
                     else:
                         # Pas de changement
-                        self.logger.info("✅ Pas de changement dans le top 3")
+                        self.logger.info(f"{LOG_EMOJIS['ok']} {LOG_MESSAGES['no_change_top']}")
                 else:
                     # Première exécution
-                    self.logger.info(f"🎯 Sélection initiale : {', '.join(new_top_symbols)}")
+                    self.logger.info(f"{LOG_EMOJIS['target']} {LOG_MESSAGES['initial_selection'].format(symbols=', '.join(new_top_symbols))}")
                 
                 # Mettre à jour la sélection précédente
                 self.previous_top_symbols = new_top_symbols.copy()
@@ -199,7 +239,7 @@ class PriceTracker:
                 self._update_funding_data_from_candidates(top_candidates)
                 
         except Exception as e:
-            self.logger.warning(f"⚠️ Erreur lors du rafraîchissement du scoring: {e}")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['error_scoring_refresh'].format(error=e)}")
     
     def _update_candidates_with_realtime_data(self, candidates):
         """
@@ -217,51 +257,52 @@ class PriceTracker:
             symbol = candidate[0]
             original_funding = candidate[1]
             original_volume = candidate[2]
-            original_funding_time = candidate[3] if len(candidate) > 3 else "-"
             original_spread = candidate[4] if len(candidate) > 4 else 0.0
             original_volatility = candidate[5] if len(candidate) > 5 else 0.0
             
+            # Récupérer le funding time depuis les données originales du WatchlistManager
+            original_funding_data = self.watchlist_manager.get_original_funding_data()
+            original_timestamp = original_funding_data.get(symbol)
+            if original_timestamp:
+                original_funding_time = self.watchlist_manager.calculate_funding_time_remaining(original_timestamp)
+            else:
+                original_funding_time = candidate[3] if len(candidate) > 3 else "-"
+            
             # Récupérer les données en temps réel si disponibles
-            realtime_info = self.realtime_data.get(symbol, {})
+            realtime_info = self.get_price(symbol)
             
-            # Utiliser les données en temps réel si disponibles, sinon garder les originales
-            funding = realtime_info.get('funding_rate', original_funding)
-            if funding is not None:
-                funding = float(funding)
-            else:
-                funding = original_funding
+            # Préparer les données REST
+            rest_data = {
+                'funding': original_funding,
+                'volume': original_volume,
+                'spread': original_spread,
+                'volatility': original_volatility,
+                'funding_time': original_funding_time
+            }
             
-            volume = realtime_info.get('volume24h', original_volume)
-            if volume is not None:
-                volume = float(volume)
-            else:
-                volume = original_volume
+            # Fusionner les données REST et WebSocket
+            merged_data = merge_symbol_data(
+                symbol=symbol,
+                rest_data=rest_data,
+                ws_data=realtime_info,
+                volatility_tracker=self.volatility_tracker
+            )
             
-            # Calculer le spread en temps réel si on a bid/ask
-            spread = original_spread
-            if realtime_info.get('bid1_price') and realtime_info.get('ask1_price'):
-                try:
-                    bid_price = float(realtime_info['bid1_price'])
-                    ask_price = float(realtime_info['ask1_price'])
-                    if bid_price > 0 and ask_price > 0:
-                        mid_price = (ask_price + bid_price) / 2
-                        if mid_price > 0:
-                            spread = (ask_price - bid_price) / mid_price
-                except (ValueError, TypeError):
-                    pass  # Garder la valeur originale en cas d'erreur
-            
-            # Récupérer la volatilité depuis le tracker
-            volatility = self.volatility_tracker.get_cached_volatility(symbol)
-            if volatility is None:
-                volatility = original_volatility
-            
-            # Recalculer le temps de funding
+            # Recalculer le temps de funding (priorité WS, fallback REST)
             funding_time = self._recalculate_funding_time(symbol)
-            if funding_time is None:
+            if funding_time == "-":
+                # Utiliser le funding time déjà calculé depuis les données originales
                 funding_time = original_funding_time
             
             # Créer le candidat mis à jour
-            updated_candidate = (symbol, funding, volume, funding_time, spread, volatility)
+            updated_candidate = (
+                merged_data['symbol'],
+                merged_data['funding'],
+                merged_data['volume'],
+                funding_time,
+                merged_data['spread'],
+                merged_data['volatility']
+            )
             updated_candidates.append(updated_candidate)
         
         return updated_candidates
@@ -295,7 +336,7 @@ class PriceTracker:
         
         if not snapshot:
             if self._first_display:
-                self.logger.info("⏳ En attente de la première donnée WS…")
+                self.logger.info(f"{LOG_EMOJIS['wait']} {LOG_MESSAGES['waiting_first_ws_data']}")
                 self._first_display = False  # Ne plus afficher ce message
             return
         
@@ -326,7 +367,8 @@ class PriceTracker:
         # Données
         for symbol, data in self.funding_data.items():
             # Récupérer les données en temps réel si disponibles
-            realtime_info = self.realtime_data.get(symbol, {})
+            realtime_info = self.get_price(symbol)
+            
             # Récupérer les valeurs initiales (REST) comme fallbacks
             # data format: (funding, volume, funding_time_remaining, spread_pct, volatility_pct)
             try:
@@ -342,50 +384,29 @@ class PriceTracker:
                 original_spread_pct = None
                 original_volatility_pct = None
             
-            # Utiliser les données en temps réel si disponibles, sinon fallback vers REST initial
-            if realtime_info:
-                # Données en temps réel disponibles - gérer les valeurs None
-                funding_rate = realtime_info.get('funding_rate')
-                funding = float(funding_rate) if funding_rate is not None else original_funding
-                
-                volume24h = realtime_info.get('volume24h')
-                volume = float(volume24h) if volume24h is not None else original_volume
-                
-                # On ne remplace pas la valeur initiale si la donnée WS est absente
-                funding_time_remaining = original_funding_time
-                
-                # Calculer le spread en temps réel si on a bid/ask
-                spread_pct = None
-                if realtime_info.get('bid1_price') and realtime_info.get('ask1_price'):
-                    try:
-                        bid_price = float(realtime_info['bid1_price'])
-                        ask_price = float(realtime_info['ask1_price'])
-                        if bid_price > 0 and ask_price > 0:
-                            mid_price = (ask_price + bid_price) / 2
-                            if mid_price > 0:
-                                spread_pct = (ask_price - bid_price) / mid_price
-                    except (ValueError, TypeError):
-                        pass  # Garder spread_pct = None en cas d'erreur
-                # Fallback: utiliser la valeur REST calculée au filtrage si le temps réel est indisponible
-                if spread_pct is None:
-                    spread_pct = original_spread_pct
-                
-                # Volatilité: utiliser la valeur stockée dans funding_data en priorité
-                volatility_pct = original_volatility_pct
-                # Fallback: lecture via le tracker dédié si pas stockée
-                if volatility_pct is None:
-                    volatility_pct = self.volatility_tracker.get_cached_volatility(symbol)
-            else:
-                # Pas de données en temps réel disponibles - utiliser les valeurs initiales REST
-                funding = original_funding
-                volume = original_volume
-                funding_time_remaining = original_funding_time
-                spread_pct = original_spread_pct
-                volatility_pct = original_volatility_pct
-                
-                # Fallback: lecture via le tracker dédié si pas stockée
-                if volatility_pct is None:
-                    volatility_pct = self.volatility_tracker.get_cached_volatility(symbol)
+            # Préparer les données REST
+            rest_data = {
+                'funding': original_funding,
+                'volume': original_volume,
+                'spread': original_spread_pct,
+                'volatility': original_volatility_pct,
+                'funding_time': original_funding_time
+            }
+            
+            # Fusionner les données REST et WebSocket
+            merged_data = merge_symbol_data(
+                symbol=symbol,
+                rest_data=rest_data,
+                ws_data=realtime_info,
+                volatility_tracker=self.volatility_tracker
+            )
+            
+            # Extraire les données fusionnées
+            funding = merged_data['funding']
+            volume = merged_data['volume']
+            spread_pct = merged_data['spread']
+            volatility_pct = merged_data['volatility']
+            funding_time_remaining = merged_data['funding_time']
             
             # Recalculer le temps de funding (priorité WS, fallback REST)
             current_funding_time = self._recalculate_funding_time(symbol)
@@ -448,7 +469,7 @@ class PriceTracker:
         try:
             config = self.watchlist_manager.load_and_validate_config()
         except ValueError as e:
-            self.logger.error(f"❌ Erreur de configuration : {e}")
+            self.logger.error(f"{LOG_EMOJIS['error']} {LOG_MESSAGES['error_config'].format(error=e)}")
             self.logger.error("💡 Corrigez les paramètres dans src/parameters.yaml ou les variables d'environnement")
             return  # Arrêt propre sans sys.exit
         
@@ -466,9 +487,9 @@ class PriceTracker:
         # Vérifier si le fichier de config existe
         config_path = "src/parameters.yaml"
         if not os.path.exists(config_path):
-            self.logger.info("ℹ️ Aucun fichier de paramètres trouvé (src/parameters.yaml) → utilisation des valeurs par défaut.")
+            self.logger.info(f"{LOG_EMOJIS['info']} {LOG_MESSAGES['config_not_found']}")
         else:
-            self.logger.info("ℹ️ Configuration chargée depuis src/parameters.yaml")
+            self.logger.info(f"{LOG_EMOJIS['info']} {LOG_MESSAGES['config_loaded_from_file']}")
         
         # Créer un client PUBLIC pour récupérer l'URL publique (aucune clé requise)
         client = BybitPublicClient(
@@ -480,7 +501,7 @@ class PriceTracker:
         
         # Récupérer l'univers perp
         perp_data = get_perp_symbols(base_url, timeout=10)
-        self.logger.info(f"🗺️ Univers perp récupéré : linear={len(perp_data['linear'])} | inverse={len(perp_data['inverse'])} | total={perp_data['total']}")
+        self.logger.info(f"{LOG_EMOJIS['map']} {LOG_MESSAGES['perp_universe_retrieved']} : linear={len(perp_data['linear'])} | inverse={len(perp_data['inverse'])} | total={perp_data['total']}")
         # Stocker le mapping officiel des catégories
         try:
             self.symbol_categories = perp_data.get("categories", {}) or {}
@@ -520,18 +541,21 @@ class PriceTracker:
         # Appliquer le classement par score pour sélectionner les meilleures paires
         filtered_candidates = self.watchlist_manager.get_filtered_candidates()
         if filtered_candidates:
-            self.logger.info("🎯 Application du classement par score...")
+            self.logger.info(f"{LOG_EMOJIS['target']} {LOG_MESSAGES['scoring_applied']}")
             top_candidates = self.scoring_engine.rank_candidates(filtered_candidates)
             
             # Reconstruire les listes de symboles et funding_data avec les paires sélectionnées
             self._rebuild_watchlist_from_scored_candidates(top_candidates)
         else:
-            self.logger.warning("⚠️ Aucune paire filtrée disponible pour le classement")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['no_filtered_pairs']}")
         
-        self.logger.info(f"📊 Symboles linear: {len(self.linear_symbols)}, inverse: {len(self.inverse_symbols)}")
+        self.logger.info(f"{LOG_EMOJIS['data']} {LOG_MESSAGES['symbols_linear_inverse'].format(linear_count=len(self.linear_symbols), inverse_count=len(self.inverse_symbols))}")
         
         # Démarrer le tracker de volatilité (arrière-plan) AVANT les WS bloquantes
         self.volatility_tracker.start_refresh_task()
+        
+        # Démarrer le rafraîchissement périodique de la watchlist si configuré
+        self.watchlist_manager.start_periodic_refresh(base_url, perp_data, self.volatility_tracker)
         
         # Démarrer l'affichage
         self.display_thread = threading.Thread(target=self._display_loop)
@@ -542,12 +566,43 @@ class PriceTracker:
         if self.linear_symbols or self.inverse_symbols:
             self.ws_manager.start_connections(self.linear_symbols, self.inverse_symbols)
         else:
-            self.logger.warning("⚠️ Aucun symbole valide trouvé")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['no_valid_symbols']}")
             raise NoSymbolsError("Aucun symbole valide trouvé")
     
     def _get_active_symbols(self) -> List[str]:
         """Retourne la liste des symboles actuellement actifs."""
         return list(self.funding_data.keys())
+    
+    def _on_watchlist_refresh(self, new_linear_symbols: List[str], new_inverse_symbols: List[str], new_funding_data: Dict):
+        """
+        Callback appelé lors du rafraîchissement de la watchlist.
+        
+        Args:
+            new_linear_symbols: Nouveaux symboles linear
+            new_inverse_symbols: Nouveaux symboles inverse
+            new_funding_data: Nouvelles données de funding
+        """
+        try:
+            self.logger.info("🔄 Mise à jour des connexions WebSocket suite au rafraîchissement de la watchlist")
+            
+            # Arrêter les connexions WebSocket actuelles
+            self.ws_manager.stop()
+            
+            # Mettre à jour les données internes
+            self.linear_symbols = new_linear_symbols
+            self.inverse_symbols = new_inverse_symbols
+            self.funding_data = new_funding_data
+            self.selected_symbols = list(new_funding_data.keys())
+            
+            # Redémarrer les connexions WebSocket avec les nouveaux symboles
+            if self.linear_symbols or self.inverse_symbols:
+                self.ws_manager.start_connections(self.linear_symbols, self.inverse_symbols)
+                self.logger.info(f"✅ Connexions WebSocket mises à jour : {len(self.linear_symbols)} linear, {len(self.inverse_symbols)} inverse")
+            else:
+                self.logger.warning("⚠️ Aucun symbole valide après rafraîchissement")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors de la mise à jour des connexions WebSocket: {e}")
     
     def _rebuild_watchlist_from_scored_candidates(self, top_candidates: List[Tuple]):
         """
@@ -584,7 +639,7 @@ class PriceTracker:
             # Ajouter aux données de funding
             self.funding_data[symbol] = (funding, volume, funding_time_remaining, spread_pct, volatility_pct)
         
-        self.logger.info(f"🔄 Watchlist reconstruite avec {len(top_candidates)} paires sélectionnées")
+        self.logger.info(f"{LOG_EMOJIS['refresh']} {LOG_MESSAGES['watchlist_rebuilt'].format(count=len(top_candidates))}")
     
     def _log_filter_config(self, config: Dict, volatility_ttl_sec: int):
         """Affiche la configuration des filtres."""
@@ -612,7 +667,7 @@ class PriceTracker:
         ft_max_display = str(funding_time_max_minutes) if funding_time_max_minutes is not None else "none"
         
         self.logger.info(
-            f"🎛️ Filtres | catégorie={categorie} | funding_min={min_display} | "
+            f"{LOG_EMOJIS['filters']} Filtres | catégorie={categorie} | funding_min={min_display} | "
             f"funding_max={max_display} | volume_min_millions={volume_display} | "
             f"spread_max={spread_display} | volatility_min={volatility_min_display} | "
             f"volatility_max={volatility_max_display} | ft_min(min)={ft_min_display} | "
@@ -626,8 +681,14 @@ def main():
     try:
         tracker.start()
     except Exception as e:
-        tracker.logger.error(f"❌ Erreur : {e}")
+        tracker.logger.error(f"{LOG_EMOJIS['error']} Erreur : {e}")
         tracker.running = False
+        # Arrêter le monitoring des métriques en cas d'erreur
+        try:
+            from metrics_monitor import stop_metrics_monitoring
+            stop_metrics_monitoring()
+        except Exception:
+            pass
         # Laisser le code appelant décider (ne pas sys.exit ici)
 
 

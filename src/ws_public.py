@@ -6,6 +6,7 @@ import time
 import websocket
 from typing import Callable, List, Optional
 from metrics import record_ws_connection, record_ws_error
+from constants.constants import LOG_EMOJIS, LOG_MESSAGES
 
 
 class PublicWSClient:
@@ -66,7 +67,7 @@ class PublicWSClient:
 
     def _on_open(self, ws):
         """Callback interne appelé à l'ouverture de la connexion."""
-        self.logger.info(f"🌐 WS ouverte ({self.category})")
+        self.logger.info(f"{LOG_EMOJIS['websocket']} {LOG_MESSAGES['ws_opened'].format(category=self.category)}")
         
         # Enregistrer la connexion WebSocket
         record_ws_connection(connected=True)
@@ -83,23 +84,23 @@ class PublicWSClient:
             try:
                 ws.send(json.dumps(subscribe_message))
                 self.logger.info(
-                    f"🧭 Souscription tickers → {len(self.symbols)} symboles ({self.category})"
+                    f"{LOG_EMOJIS['watchlist']} {LOG_MESSAGES['ws_subscription'].format(count=len(self.symbols), category=self.category)}"
                 )
             except (json.JSONEncodeError, ConnectionError, OSError) as e:
                 self.logger.error(
                     f"Erreur souscription WebSocket {self.category}: {type(e).__name__}: {e}"
                 )
             except Exception as e:
-                self.logger.warning(f"⚠️ Erreur souscription {self.category}: {e}")
+                self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['ws_subscription_error'].format(category=self.category, error=e)}")
         else:
-            self.logger.warning(f"⚠️ Aucun symbole à suivre pour {self.category}")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['ws_no_symbols'].format(category=self.category)}")
         
         # Appeler le callback externe si défini
         if self.on_open_callback:
             try:
                 self.on_open_callback()
             except Exception as e:
-                self.logger.warning(f"⚠️ Erreur callback on_open: {e}")
+                self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['ws_callback_error'].format(error=e)} {e}")
 
     def _on_message(self, ws, message):
         """Callback interne appelé à chaque message reçu."""
@@ -110,7 +111,7 @@ class PublicWSClient:
                 if ticker_data:
                     self.on_ticker_callback(ticker_data)
         except json.JSONDecodeError as e:
-            self.logger.warning(f"⚠️ Erreur JSON ({self.category}): {e}")
+            self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['ws_json_error'].format(category=self.category, error=e)}")
         except (KeyError, TypeError, AttributeError) as e:
             self.logger.warning(
                 f"⚠️ Erreur parsing données ({self.category}): {type(e).__name__}: {e}"
@@ -244,6 +245,8 @@ class SimplePublicWSClient:
     """
     Version simplifiée du client WebSocket publique pour les tests et usages basiques.
     
+    NOTE: SimplePublicWSClient n'est PAS utilisée dans le bot principal (bot.py).
+    Cette classe est utilisée uniquement dans app.py pour la supervision/debug.
     Ne gère que la connexion basique sans souscription automatique aux symboles.
     """
     
@@ -289,7 +292,7 @@ class SimplePublicWSClient:
             try:
                 self.on_open_callback()
             except Exception as e:
-                self.logger.warning(f"⚠️ Erreur callback on_open: {e}")
+                self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['ws_callback_error'].format(error=e)} {e}")
 
     def _on_message(self, ws, message):
         """Callback interne appelé à chaque message."""

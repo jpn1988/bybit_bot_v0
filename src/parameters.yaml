@@ -17,7 +17,7 @@ categorie: "linear"      # "linear" | "inverse" | "both"
 funding_min: 0.0005     # ex: 0.0001 pour >= 0.01%  | null = pas de min
 funding_max: null        # ex: 0.0005 pour <= 0.05%  | null = pas de max
 volume_min: null     # ex: 1000000 pour >= 1M USDT | null = pas de min [ANCIEN]
-volume_min_millions: 50   # ex: 5.0 pour >= 5M USDT | null = pas de min [NOUVEAU]
+volume_min_millions: 100   # ex: 5.0 pour >= 5M USDT | null = pas de min [NOUVEAU]
 # Normalisation: spread exprimé en ratio (0.003 = 0.30%)
 spread_max: 0.03        # ex: 0.003 pour <= 0.30% | null = pas de filtre
 volatility_min: null     # ex: 0.002 pour >= 0.20% | null = pas de min [NOUVEAU]
@@ -26,6 +26,7 @@ volatility_ttl_sec: 120  # TTL du cache volatilité (secondes)
 limite: null               # ex: 10  | null = pas de limite
 funding_time_min_minutes:    # Optionnel: minimum 30 minutes avant funding
 funding_time_max_minutes: 1400  # Optionnel: maximum 120 minutes avant funding
+refresh_watchlist_interval: 0  # Intervalle (en secondes) pour relancer build_watchlist() et resouscrire aux WS. Mettre 0 pour désactiver. Exemple: 7200 = 2h
 
 # ============================================
 # Configuration du classement des paires (FR)
