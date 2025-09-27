@@ -41,7 +41,8 @@ def get_settings():
             "PATHEXT", "PROCESSOR", "NUMBER_OF_PROCESSORS", "OS", "DRIVE",
             "VIRTUAL_ENV", "CONDA", "PIP", "NODE", "NPM", "GIT", "SSH",
             "DOCKER", "KUBERNETES", "AWS", "AZURE", "GOOGLE", "JAVA",
-            "MAVEN", "GRADLE", "NODEJS", "NPM", "YARN", "BOWER"
+            "MAVEN", "GRADLE", "NODEJS", "NPM", "YARN", "BOWER",
+            "FPS", "BROWSER", "FIREFOX", "CHROME", "EDGE", "SAFARI"
         ]):
             # Vérifier si la variable semble liée au bot (contient des mots-clés)
             if any(keyword in var.upper() for keyword in [

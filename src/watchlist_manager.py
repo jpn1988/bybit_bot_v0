@@ -96,6 +96,9 @@ class WatchlistManager:
             "volatility_max": None,
             "limite": 10,
             "volatility_ttl_sec": 120,
+            # Debug WebSocket
+            "debug_ws": False,
+            "debug_ws_inactivity_s": 10,
             # Nouveaux paramètres temporels
             "funding_time_min_minutes": None,
             "funding_time_max_minutes": None,

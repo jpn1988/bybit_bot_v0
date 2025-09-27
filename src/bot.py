@@ -35,6 +35,8 @@ from constants.constants import LOG_EMOJIS, LOG_MESSAGES
 from metrics_monitor import start_metrics_monitoring
 from http_client_manager import close_all_http_clients
 from utils import compute_spread_with_mid_price, merge_symbol_data
+from utils import normalize_next_funding_to_epoch_seconds
+from turbo import TurboManager
 
 
 class PriceTracker:
@@ -60,8 +62,28 @@ class PriceTracker:
         settings = get_settings()
         self.testnet = settings['testnet']
         
-        # Gestionnaire WebSocket dédié
-        self.ws_manager = WebSocketManager(testnet=self.testnet, logger=self.logger)
+        # Gestionnaire WebSocket dédié (propager debug_ws)
+        # Charger la config YAML via le watchlist manager pour récupérer debug_ws
+        tmp_wm = WatchlistManager(testnet=self.testnet, logger=self.logger)
+        try:
+            config = tmp_wm.load_and_validate_config()
+        except Exception:
+            config = {}
+        # Lire le flag debug_logs pour contrôler la verbosité applicative
+        self.debug_logs = bool(config.get('debug_logs', False))
+        # Intervalle d'affichage/rafraîchissement marché
+        try:
+            self.refresh_interval = int(config.get('refresh_interval', 15) or 15)
+        except Exception:
+            self.refresh_interval = 15
+        debug_ws = bool(config.get('debug_ws', False))
+        debug_ws_inactivity_s = int(config.get('debug_ws_inactivity_s', 10) or 10)
+        self.ws_manager = WebSocketManager(
+            testnet=self.testnet,
+            logger=self.logger,
+            debug_ws=debug_ws,
+            debug_ws_inactivity_s=debug_ws_inactivity_s,
+        )
         self.ws_manager.set_ticker_callback(self._update_realtime_data_from_ticker)
         
         # Gestionnaire de volatilité dédié
@@ -79,11 +101,16 @@ class PriceTracker:
         # Suivi de la sélection précédente pour détecter les changements
         self.previous_top_symbols = []
         
+        # TurboManager (sera initialisé avec la config)
+        self.turbo_manager = None
+        
         # Configuration du signal handler pour Ctrl+C
         signal.signal(signal.SIGINT, self._signal_handler)
         
         self.logger.info(f"{LOG_EMOJIS['start']} Orchestrateur du bot (filters + WebSocket prix)")
         self.logger.info(f"{LOG_EMOJIS['config']} {LOG_MESSAGES['config_loaded']}")
+        # Log de niveau pour information
+        self.logger.info(f"[Logs] debug_logs={'on' if self.debug_logs else 'off'} | debug_ws={'on' if debug_ws else 'off'}")
         
         # Démarrer le monitoring des métriques
         start_metrics_monitoring(interval_minutes=5)
@@ -107,6 +134,15 @@ class PriceTracker:
             self.watchlist_manager.stop_periodic_refresh()
         except Exception:
             pass
+        # Arrêter le TurboManager
+        try:
+            if self.turbo_manager:
+                # Arrêter tous les symboles actifs
+                for symbol in list(self.turbo_manager.active.keys()):
+                    self.turbo_manager.stop_for_symbol(symbol, "Arrêt du bot")
+        except Exception:
+            pass
+        
         # Arrêter le monitoring des métriques
         try:
             from metrics_monitor import stop_metrics_monitoring
@@ -173,8 +209,70 @@ class PriceTracker:
                             merged[k] = v
                     merged['timestamp'] = now_ts
                     self.realtime_data[symbol] = merged
+                    
+                    # Vérifier le déclenchement turbo en temps réel
+                    self._check_realtime_turbo_trigger(symbol, merged)
+                    
         except Exception as e:
             self.logger.warning(f"{LOG_EMOJIS['warn']} Erreur mise à jour données temps réel pour {symbol}: {e}")
+    
+    def _check_realtime_turbo_trigger(self, symbol: str, realtime_data: dict):
+        """
+        Vérifie en temps réel si un symbole doit entrer en mode turbo.
+        Appelé à chaque mise à jour WebSocket pour un déclenchement immédiat.
+        
+        Args:
+            symbol: Symbole à vérifier
+            realtime_data: Données temps réel du symbole
+        """
+        try:
+            # Vérifier si le turbo est activé et si le symbole n'est pas déjà en turbo
+            if not self.turbo_manager or not self.turbo_manager.enabled:
+                return
+                
+            if self.turbo_manager.is_active(symbol):
+                return
+            
+            # Vérifier si le symbole est dans la watchlist actuelle
+            if symbol not in self.symbols:
+                return
+            
+            # Calculer le funding_time en secondes
+            funding_time_seconds = self._get_funding_time_seconds(symbol)
+            if funding_time_seconds is None:
+                return
+            
+            # Vérifier si éligible pour le turbo
+            trigger_seconds = self.turbo_manager.trigger_seconds
+            condition_met = funding_time_seconds <= trigger_seconds
+            self.logger.info(f"🔍 [REALTIME CHECK] {symbol} | funding_time_seconds={funding_time_seconds}s | trigger_seconds={trigger_seconds}s | condition_met={condition_met}")
+            
+            if condition_met:
+                # Récupérer les données du symbole pour les métadonnées
+                symbol_data = self.funding_data.get(symbol)
+                if not symbol_data:
+                    return
+                
+                # Préparer les métadonnées
+                funding, volume, funding_time_remaining, spread_pct, volatility_pct = symbol_data
+                meta = {
+                    "funding_time": funding_time_seconds,
+                    "score": 0.0,  # Score sera recalculé dans le turbo
+                    "funding_rate": funding,
+                    "volume": volume,
+                    "spread": spread_pct,
+                    "volatility": volatility_pct
+                }
+                
+                # Démarrer le turbo
+                success = self.turbo_manager.start_for_symbol(symbol, meta)
+                if success:
+                    self.logger.info(f"🚀 [Turbo ON] {symbol} t={funding_time_seconds}s (<= {trigger_seconds}s) - Déclenchement temps réel")
+                else:
+                    self.logger.debug(f"⚠️ Échec démarrage turbo pour {symbol} (limite atteinte ou autre)")
+                    
+        except Exception as e:
+            self.logger.debug(f"Erreur vérification turbo temps réel pour {symbol}: {e}")
     
     def _recalculate_funding_time(self, symbol: str) -> str:
         """Retourne le temps restant basé uniquement sur nextFundingTime (WS puis REST)."""
@@ -237,6 +335,16 @@ class PriceTracker:
                 
                 # Mettre à jour les données de funding pour l'affichage
                 self._update_funding_data_from_candidates(top_candidates)
+                
+                # Déclencher le mode turbo pour les candidats éligibles
+                self._trigger_turbo_for_candidates(top_candidates)
+                
+                # Vérifier les conditions turbo en continu pour toutes les paires sélectionnées
+                self._check_continuous_turbo_conditions(top_candidates)
+                
+                # Vérifier les candidats avec la nouvelle logique turbo
+                if self.turbo_manager and self.turbo_manager.enabled:
+                    self.turbo_manager.check_candidates(top_candidates)
                 
         except Exception as e:
             self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['error_scoring_refresh'].format(error=e)}")
@@ -305,6 +413,10 @@ class PriceTracker:
             )
             updated_candidates.append(updated_candidate)
         
+        # Vérifier les conditions turbo en continu même si refresh_watchlist_interval = 0
+        if updated_candidates and self.turbo_manager and self.turbo_manager.enabled:
+            self._check_continuous_turbo_conditions(updated_candidates)
+        
         return updated_candidates
     
     def _update_funding_data_from_candidates(self, candidates):
@@ -324,6 +436,195 @@ class PriceTracker:
             volatility_pct = candidate[5] if len(candidate) > 5 else None
             
             self.funding_data[symbol] = (funding, volume, funding_time_remaining, spread_pct, volatility_pct)
+    
+    def _trigger_turbo_for_candidates(self, top_candidates):
+        """
+        Déclenche le mode turbo pour les candidats éligibles.
+        
+        Args:
+            top_candidates: Liste des paires sélectionnées avec leur score
+        """
+        if not self.turbo_manager or not self.turbo_manager.enabled:
+            return
+            
+        trigger_seconds = self.turbo_manager.trigger_seconds
+        allow_midcycle_switch = self.turbo_manager.allow_midcycle_topn_switch
+        
+        # Si allow_midcycle_topn_switch = false, ne pas arrêter les paires déjà en turbo
+        if not allow_midcycle_switch:
+            # Garder les paires déjà en turbo même si elles ne sont plus dans le top_n
+            active_symbols = list(self.turbo_manager.active.keys())
+            for symbol in active_symbols:
+                if not any(candidate[0] == symbol for candidate in top_candidates):
+                    self.logger.debug(f"🔄 Garde {symbol} en turbo (allow_midcycle_topn_switch=false)")
+        
+        for candidate in top_candidates:
+            symbol = candidate[0]
+            score = candidate[-1] if len(candidate) > 6 else 0.0
+            
+            # Vérifier si déjà actif
+            if self.turbo_manager.is_active(symbol):
+                continue
+                
+            # Récupérer le funding_time fiable
+            funding_time_seconds = self._get_funding_time_seconds(symbol)
+            
+            if funding_time_seconds is None:
+                continue
+            
+            # Log de debug pour chaque paire
+            self.logger.debug(f"🔍 [Turbo CHECK] {symbol} funding_time={funding_time_seconds}s (threshold={trigger_seconds}s)")
+                
+            # Vérifier si éligible pour le turbo
+            condition_met = funding_time_seconds <= trigger_seconds
+            self.logger.info(f"🔍 [BOT CHECK] {symbol} | funding_time_seconds={funding_time_seconds}s | trigger_seconds={trigger_seconds}s | condition_met={condition_met}")
+            
+            if condition_met:
+                # Préparer les métadonnées
+                meta = {
+                    "funding_time": funding_time_seconds,
+                    "score": score,
+                    "funding_rate": candidate[1] if len(candidate) > 1 else 0.0,
+                    "volume": candidate[2] if len(candidate) > 2 else 0.0,
+                    "spread": candidate[4] if len(candidate) > 4 else 0.0,
+                    "volatility": candidate[5] if len(candidate) > 5 else 0.0
+                }
+                
+                # Démarrer le turbo
+                success = self.turbo_manager.start_for_symbol(symbol, meta)
+                if success:
+                    self.logger.info(f"🚀 [Turbo ON] {symbol} funding_time={funding_time_seconds}s")
+    
+    def _get_funding_time_seconds(self, symbol: str) -> int:
+        """
+        Récupère le temps de funding en secondes pour un symbole.
+        
+        Args:
+            symbol: Symbole à vérifier
+            
+        Returns:
+            int: Temps restant en secondes, ou None si non disponible
+        """
+        try:
+            # Essayer d'abord les données temps réel
+            realtime_info = self.get_price(symbol)
+            next_funding_time = realtime_info.get('next_funding_time')
+            
+            if next_funding_time:
+                now = time.time()
+                ts_sec = normalize_next_funding_to_epoch_seconds(next_funding_time)
+                if ts_sec is not None:
+                    remaining = int(ts_sec - now)
+                    if self.debug_logs:
+                        self.logger.info(f"[Turbo DBG] {symbol} t={remaining}s")
+                    return max(0, remaining)
+            
+            # Fallback sur les données originales
+            original_funding_data = self.watchlist_manager.get_original_funding_data()
+            rest_ts = original_funding_data.get(symbol)
+            if rest_ts:
+                now = time.time()
+                remaining = int(rest_ts - now)
+                return max(0, remaining)
+                
+            # Fallback sur funding_data
+            if symbol in self.funding_data:
+                funding_time_str = self.funding_data[symbol][2]  # funding_time_remaining
+                if funding_time_str != "-":
+                    # Convertir "1m30s" en secondes
+                    import re
+                    match = re.match(r'(\d+)m(\d+)s', str(funding_time_str))
+                    if match:
+                        minutes, seconds = map(int, match.groups())
+                        return minutes * 60 + seconds
+                    # Essayer de parser directement un nombre
+                    try:
+                        return int(funding_time_str)
+                    except ValueError:
+                        pass
+                    # Essayer de parser "45s" directement
+                    match_s = re.match(r'(\d+)s', str(funding_time_str))
+                    if match_s:
+                        return int(match_s.group(1))
+                        
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Erreur récupération funding_time pour {symbol}: {e}")
+            return None
+    
+    def _check_continuous_turbo_conditions(self, top_candidates):
+        """
+        Vérifie en continu les conditions turbo pour toutes les paires sélectionnées.
+        Cette méthode est appelée après chaque cycle de mise à jour des données.
+        
+        Args:
+            top_candidates: Liste des paires sélectionnées avec leur score
+        """
+        if not self.turbo_manager or not self.turbo_manager.enabled:
+            return
+            
+        trigger_seconds = self.turbo_manager.trigger_seconds
+        
+        # Vérifier chaque paire sélectionnée
+        for candidate in top_candidates:
+            symbol = candidate[0]
+            score = candidate[-1] if len(candidate) > 6 else 0.0
+            
+            # Récupérer le funding_time depuis les données des candidats
+            funding_time_seconds = self._get_funding_time_seconds(symbol)
+            if funding_time_seconds is None:
+                # Essayer de parser le funding_time depuis les données des candidats
+                funding_time_str = candidate[3] if len(candidate) > 3 else None
+                if funding_time_str and isinstance(funding_time_str, str):
+                    # Parser le format "1m30s" ou "45s"
+                    import re
+                    match_m = re.match(r'(\d+)m(\d+)s', funding_time_str)
+                    if match_m:
+                        minutes = int(match_m.group(1))
+                        seconds = int(match_m.group(2))
+                        funding_time_seconds = minutes * 60 + seconds
+                    else:
+                        match_s = re.match(r'(\d+)s', funding_time_str)
+                        if match_s:
+                            funding_time_seconds = int(match_s.group(1))
+                
+                if funding_time_seconds is None:
+                    continue
+            
+            # Log de debug pour chaque paire
+            self.logger.debug(f"🔍 [Turbo CHECK] {symbol} funding_time={funding_time_seconds}s (threshold={trigger_seconds}s)")
+            
+            # Vérifier si la paire est actuellement en turbo
+            is_currently_turbo = self.turbo_manager.is_active(symbol)
+            
+            # Vérifier si elle devrait être en turbo
+            should_be_turbo = funding_time_seconds <= trigger_seconds
+            self.logger.debug(f"🔍 [BOT CHECK] {symbol} | funding_time_seconds={funding_time_seconds}s | trigger_seconds={trigger_seconds}s | should_be_turbo={should_be_turbo}")
+            
+            if should_be_turbo and not is_currently_turbo:
+                # La paire devrait être en turbo mais ne l'est pas
+                # Préparer les métadonnées
+                meta = {
+                    "funding_time": funding_time_seconds,
+                    "score": score,
+                    "funding_rate": candidate[1] if len(candidate) > 1 else 0.0,
+                    "volume": candidate[2] if len(candidate) > 2 else 0.0,
+                    "spread": candidate[4] if len(candidate) > 4 else 0.0,
+                    "volatility": candidate[5] if len(candidate) > 5 else 0.0
+                }
+                
+                # Démarrer le turbo
+                success = self.turbo_manager.start_for_symbol(symbol, meta)
+                if success:
+                    self.logger.info(f"🚀 [Turbo ON] {symbol} funding_time={funding_time_seconds}s")
+                else:
+                    self.logger.debug(f"⚠️ Échec démarrage turbo pour {symbol} (limite atteinte ou autre)")
+                    
+            elif not should_be_turbo and is_currently_turbo:
+                # La paire est en turbo mais ne devrait plus l'être
+                self.logger.info(f"🛑 [Turbo OFF] {symbol} (funding dans {funding_time_seconds}s > {trigger_seconds}s) - Sortie des conditions")
+                self.turbo_manager.stop_for_symbol(symbol, "sortie_conditions")
     
     def _print_price_table(self):
         """Affiche le tableau des prix aligné avec funding, volume en millions, spread et volatilité."""
@@ -449,7 +750,7 @@ class PriceTracker:
         print()  # Ligne vide après le tableau
     
     def _display_loop(self):
-        """Boucle d'affichage toutes les 15 secondes."""
+        """Boucle d'affichage/rafraîchissement marché selon refresh_interval (défaut 15s)."""
         while self.running:
             # Rafraîchir le filtrage et le scoring avant l'affichage
             self._refresh_filtering_and_scoring()
@@ -457,11 +758,18 @@ class PriceTracker:
             # Afficher le tableau des prix
             self._print_price_table()
             
-            # Attendre 15 secondes
-            for _ in range(150):  # 150 * 0.1s = 15s
-                if not self.running:
-                    break
-                time.sleep(0.1)
+            try:
+                self.logger.info("✅ Refresh marché exécuté")
+            except Exception:
+                pass
+            
+            # Attendre l'intervalle configuré
+            total_sleep = float(getattr(self, 'refresh_interval', 15))
+            slept = 0.0
+            step = 0.1
+            while self.running and slept < total_sleep:
+                time.sleep(step)
+                slept += step
     
     def start(self):
         """Démarre le suivi des prix avec filtrage par funding."""
@@ -476,6 +784,17 @@ class PriceTracker:
         # Initialiser le moteur de scoring avec la configuration
         self.scoring_engine = ScoringEngine(config, logger=self.logger)
         
+        # Initialiser le TurboManager avec la configuration
+        self.turbo_manager = TurboManager(
+            config=config,
+            data_fetcher=self,  # PriceTracker implémente get_price
+            order_client=None,  # TODO: Intégrer le client d'ordres
+            filters=self.watchlist_manager,  # Utiliser le watchlist manager comme filtre
+            scorer=self.scoring_engine,
+            volatility_tracker=self.volatility_tracker,
+            logger=self.logger
+        )
+        
         # Afficher la configuration du scoring
         scoring_config = self.scoring_engine.get_scoring_config()
         self.logger.info(f"[Scoring Config] funding={scoring_config['weight_funding']} | "
@@ -483,6 +802,10 @@ class PriceTracker:
                         f"spread={scoring_config['weight_spread']} | "
                         f"vol={scoring_config['weight_volatility']} | "
                         f"top_n={scoring_config['top_n']}")
+        
+        # Afficher le statut du mode turbo
+        turbo_status = self.turbo_manager.get_status()
+        self.logger.info(f"🚀 Turbo: enabled={turbo_status['enabled']}")
         
         # Vérifier si le fichier de config existe
         config_path = "src/parameters.yaml"
@@ -546,6 +869,9 @@ class PriceTracker:
             
             # Reconstruire les listes de symboles et funding_data avec les paires sélectionnées
             self._rebuild_watchlist_from_scored_candidates(top_candidates)
+            
+            # Déclencher le mode turbo pour les candidats éligibles
+            self._trigger_turbo_for_candidates(top_candidates)
         else:
             self.logger.warning(f"{LOG_EMOJIS['warn']} {LOG_MESSAGES['no_filtered_pairs']}")
         
@@ -562,6 +888,11 @@ class PriceTracker:
         self.display_thread.daemon = True
         self.display_thread.start()
 
+        # Transmettre la watchlist au TurboManager avec logs de debug
+        all_symbols = self.linear_symbols + self.inverse_symbols
+        self.logger.info(f"[DEBUG] Watchlist finale transmise au TurboManager: {all_symbols}")
+        self.turbo_manager.update_watchlist(all_symbols)
+        
         # Démarrer les connexions WebSocket via le gestionnaire dédié
         if self.linear_symbols or self.inverse_symbols:
             self.ws_manager.start_connections(self.linear_symbols, self.inverse_symbols)
@@ -593,6 +924,11 @@ class PriceTracker:
             self.inverse_symbols = new_inverse_symbols
             self.funding_data = new_funding_data
             self.selected_symbols = list(new_funding_data.keys())
+            
+            # Transmettre la nouvelle watchlist au TurboManager avec logs de debug
+            all_symbols = self.linear_symbols + self.inverse_symbols
+            self.logger.info(f"[DEBUG] Watchlist rafraîchie transmise au TurboManager: {all_symbols}")
+            self.turbo_manager.update_watchlist(all_symbols)
             
             # Redémarrer les connexions WebSocket avec les nouveaux symboles
             if self.linear_symbols or self.inverse_symbols:

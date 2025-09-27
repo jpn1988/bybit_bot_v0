@@ -168,3 +168,49 @@ def merge_symbol_data(
         'volatility': volatility,
         'funding_time': funding_time
     }
+
+
+def normalize_next_funding_to_epoch_seconds(next_funding_time: Any) -> Optional[int]:
+    """
+    Normalise une valeur next_funding_time potentiellement en millisecondes, secondes (epoch)
+    ou ISO8601 vers un timestamp epoch en secondes.
+
+    Args:
+        next_funding_time: Valeur brute (int/float ms ou s, str chiffre ms/s, ou ISO8601)
+
+    Returns:
+        int | None: timestamp en secondes, ou None si parsing impossible
+    """
+    try:
+        # Numérique direct
+        if isinstance(next_funding_time, (int, float)):
+            ts = float(next_funding_time)
+            # Heuristique: > 1e12 = ms, > 1e10 (float) potentiellement ms
+            if ts > 1_000_000_000_000:
+                return int(ts / 1000)
+            # 10-digits ~ seconds
+            return int(ts)
+
+        # Chaîne de caractères
+        if isinstance(next_funding_time, str):
+            s = next_funding_time.strip()
+            # Si purement numérique
+            if s.isdigit():
+                ts = float(s)
+                if ts > 1_000_000_000_000:
+                    return int(ts / 1000)
+                return int(ts)
+            # Essayer ISO8601
+            try:
+                import datetime
+                iso = s.replace('Z', '+00:00')
+                dt = datetime.datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                return int(dt.timestamp())
+            except Exception:
+                return None
+
+        return None
+    except Exception:
+        return None

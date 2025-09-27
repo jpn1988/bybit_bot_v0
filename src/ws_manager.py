@@ -11,6 +11,9 @@ Cette classe gère uniquement :
 import threading
 import time
 from typing import List, Callable, Optional
+from bybit_client import BybitPublicClient
+from instruments import category_of_symbol
+from http_client_manager import get_http_client
 from logging_setup import setup_logging
 from ws_public import PublicWSClient
 from price_store import update
@@ -27,7 +30,7 @@ class WebSocketManager:
     - Callbacks vers l'application principale
     """
     
-    def __init__(self, testnet: bool = True, logger=None):
+    def __init__(self, testnet: bool = True, logger=None, *, debug_ws: bool = False, debug_ws_inactivity_s: int = 10):
         """
         Initialise le gestionnaire WebSocket.
         
@@ -38,6 +41,8 @@ class WebSocketManager:
         self.testnet = testnet
         self.logger = logger or setup_logging()
         self.running = False
+        self.debug_ws = bool(debug_ws)
+        self.debug_ws_inactivity_s = int(debug_ws_inactivity_s) if debug_ws_inactivity_s is not None else 10
         
         # Connexions WebSocket
         self._ws_conns: List[PublicWSClient] = []
@@ -71,8 +76,9 @@ class WebSocketManager:
             self.logger.warning("⚠️ WebSocketManager déjà en cours d'exécution")
             return
         
-        self.linear_symbols = linear_symbols or []
-        self.inverse_symbols = inverse_symbols or []
+        # Valider les symboles via REST (instruments-info) avant souscription
+        self.linear_symbols = self._validate_symbols(linear_symbols or [], "linear")
+        self.inverse_symbols = self._validate_symbols(inverse_symbols or [], "inverse")
         self.running = True
         
         # Déterminer le type de connexions nécessaires
@@ -87,6 +93,46 @@ class WebSocketManager:
             self._start_single_connection("inverse", self.inverse_symbols)
         else:
             self.logger.warning("⚠️ Aucun symbole fourni pour les connexions WebSocket")
+
+    def _validate_symbols(self, symbols: List[str], category: str) -> List[str]:
+        """Valide l'existence des symboles via l'API `instruments-info`. Retourne uniquement ceux trouvés."""
+        if not symbols:
+            return []
+        try:
+            public_client = BybitPublicClient(testnet=self.testnet, timeout=10)
+            base_url = public_client.public_base_url()
+            url = f"{base_url}/v5/market/instruments-info"
+            client = get_http_client(timeout=10)
+            valid: List[str] = []
+            for sym in symbols:
+                # Déterminer la catégorie attendue pour le symbole si besoin
+                wanted_category = category
+                try:
+                    wanted_category = category_of_symbol(sym, {sym: category})
+                except Exception:
+                    pass
+                resp = client.get(url, params={"category": wanted_category, "symbol": sym})
+                try:
+                    if resp.status_code >= 400:
+                        self.logger.warning(f"[WS ERROR] HTTP {resp.status_code} instruments-info pour {sym}")
+                        continue
+                    data = resp.json()
+                    if data.get("retCode") != 0:
+                        ret_msg = data.get("retMsg") or data.get("ret_msg") or ""
+                        self.logger.warning(f"[WS ERROR] API instruments-info retCode={data.get('retCode')} msg=\"{ret_msg}\" pour {sym}")
+                        continue
+                    result = (data.get("result") or {}).get("list") or []
+                    if result:
+                        valid.append(sym)
+                    else:
+                        self.logger.error(f"[WS ERROR] Symbole {sym} introuvable sur Bybit")
+                except Exception as e:
+                    self.logger.warning(f"[WS ERROR] Validation symbole {sym} échouée → {e}")
+            return valid
+        except Exception as e:
+            self.logger.warning(f"[WS ERROR] Validation REST des symboles échouée → {e}")
+            # En cas d'erreur globale, retourner la liste originale pour ne pas bloquer
+            return symbols
     
     def _handle_ticker(self, ticker_data: dict):
         """
@@ -127,7 +173,9 @@ class WebSocketManager:
             symbols=symbols,
             testnet=self.testnet,
             logger=self.logger,
-            on_ticker_callback=self._handle_ticker
+            on_ticker_callback=self._handle_ticker,
+            debug_ws=self.debug_ws,
+            debug_ws_inactivity_s=self.debug_ws_inactivity_s,
         )
         self._ws_conns = [conn]
         
@@ -144,14 +192,18 @@ class WebSocketManager:
             symbols=self.linear_symbols,
             testnet=self.testnet,
             logger=self.logger,
-            on_ticker_callback=self._handle_ticker
+            on_ticker_callback=self._handle_ticker,
+            debug_ws=self.debug_ws,
+            debug_ws_inactivity_s=self.debug_ws_inactivity_s,
         )
         inverse_conn = PublicWSClient(
             category="inverse",
             symbols=self.inverse_symbols,
             testnet=self.testnet,
             logger=self.logger,
-            on_ticker_callback=self._handle_ticker
+            on_ticker_callback=self._handle_ticker,
+            debug_ws=self.debug_ws,
+            debug_ws_inactivity_s=self.debug_ws_inactivity_s,
         )
         
         self._ws_conns = [linear_conn, inverse_conn]
@@ -216,3 +268,66 @@ class WebSocketManager:
             "linear": self.linear_symbols.copy(),
             "inverse": self.inverse_symbols.copy()
         }
+    
+    def subscribe_turbo_symbol(self, symbol: str):
+        """
+        Souscrit dynamiquement aux topics pour un symbole en mode turbo.
+        
+        Args:
+            symbol: Symbole à ajouter aux souscriptions
+        """
+        if not self.running or not self._ws_conns:
+            self.logger.warning(f"[WS TURBO] Impossible de souscrire à {symbol} - WebSocket non connecté")
+            return False
+        
+        try:
+            # Déterminer la catégorie du symbole
+            category = "linear"  # Par défaut
+            if symbol in self.inverse_symbols:
+                category = "inverse"
+            elif symbol in self.linear_symbols:
+                category = "linear"
+            
+            # Trouver la connexion appropriée
+            target_conn = None
+            for conn in self._ws_conns:
+                if conn.category == category:
+                    target_conn = conn
+                    break
+            
+            if not target_conn:
+                self.logger.warning(f"[WS TURBO] Aucune connexion trouvée pour {symbol} (catégorie: {category})")
+                return False
+            
+            # Topics à souscrire pour le turbo
+            turbo_topics = [
+                f"instrument_info.{symbol}",
+                f"publicTrade.{symbol}",
+                f"orderbook.1.{symbol}"
+            ]
+            
+            # Envoyer la souscription
+            subscribe_message = {
+                "op": "subscribe",
+                "args": turbo_topics
+            }
+            
+            import json
+            import websocket
+            
+            if hasattr(target_conn, 'ws') and target_conn.ws:
+                target_conn.ws.send(json.dumps(subscribe_message))
+                
+                # Logger les souscriptions
+                for topic in turbo_topics:
+                    self.logger.info(f"[WS SUBSCRIBE] {topic}")
+                
+                self.logger.info(f"🚀 [Turbo WS] Souscription activée pour {symbol}")
+                return True
+            else:
+                self.logger.warning(f"[WS TURBO] WebSocket non disponible pour {symbol}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"[WS TURBO] Erreur souscription {symbol}: {e}")
+            return False

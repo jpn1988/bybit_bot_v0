@@ -17,16 +17,40 @@ categorie: "linear"      # "linear" | "inverse" | "both"
 funding_min: 0.0005     # ex: 0.0001 pour >= 0.01%  | null = pas de min
 funding_max: null        # ex: 0.0005 pour <= 0.05%  | null = pas de max
 volume_min: null     # ex: 1000000 pour >= 1M USDT | null = pas de min [ANCIEN]
-volume_min_millions: 100   # ex: 5.0 pour >= 5M USDT | null = pas de min [NOUVEAU]
+volume_min_millions: 50   # ex: 5.0 pour >= 5M USDT | null = pas de min [NOUVEAU]
 # Normalisation: spread exprimé en ratio (0.003 = 0.30%)
-spread_max: 0.03        # ex: 0.003 pour <= 0.30% | null = pas de filtre
+spread_max: 0.3        # ex: 0.003 pour <= 0.30% | null = pas de filtre
 volatility_min: null     # ex: 0.002 pour >= 0.20% | null = pas de min [NOUVEAU]
 volatility_max: 0.07    # ex: 0.007 pour <= 0.70% | null = pas de max [NOUVEAU]
 volatility_ttl_sec: 120  # TTL du cache volatilité (secondes)
 limite: null               # ex: 10  | null = pas de limite
 funding_time_min_minutes:    # Optionnel: minimum 30 minutes avant funding
-funding_time_max_minutes: 1400  # Optionnel: maximum 120 minutes avant funding
+funding_time_max_minutes: 240  # Optionnel: maximum 120 minutes avant funding
 refresh_watchlist_interval: 0  # Intervalle (en secondes) pour relancer build_watchlist() et resouscrire aux WS. Mettre 0 pour désactiver. Exemple: 7200 = 2h
+refresh_interval: 15           # Intervalle d'affichage/rafraîchissement marché (secondes)
+
+# ============================================
+# Logs (FR)
+# - debug_logs : active les logs détaillés (DEBUG) de l'application
+# ============================================
+debug_logs: false
+
+# ============================================
+# Debug WebSocket (FR)
+# - debug_ws : active l'impression des messages bruts WS avant parsing
+# - debug_ws_inactivity_s : délai d'alerte si aucun message par topic (secondes)
+# ============================================
+debug_ws: false
+debug_ws_inactivity_s: 10
+
+# ============================================
+# Logging WebSocket (FR)
+# - logging.debug_trades : affiche les trades/orderbook détaillés (bruyant)
+# ============================================
+logging:
+  debug_trades: false
+  debug_ws_ticks: false
+  ws_ticks_summary_interval_s: 10
 
 # ============================================
 # Configuration du classement des paires (FR)
@@ -44,3 +68,61 @@ scoring:
   weight_spread: 300      # Poids du spread (défaut: 200)
   weight_volatility: 3000   # Poids de la volatilité (défaut: 50)
   top_n: 3                # Nombre de meilleures paires à garder (défaut: 1)
+
+# ============================================
+# Configuration du Mode Turbo (FR)
+# - enabled : active/désactive le mode turbo
+# - trigger_seconds : seuil d'entrée en turbo (t <= 70s)
+# - entry_seconds : placement de l'ordre à t = 60s
+# - refresh_ms : rafraîchissement turbo (ms)
+# - max_parallel_pairs : nombre max de paires en turbo en parallèle
+# - tick_logging : logs à chaque tick turbo
+# - cooldown_s : délai avant rééligibilité après funding/sortie
+# - cancel_on_filter_break : annuler ordre / fermer si filtre casse
+# - miss_order_timeout_s : ordre pas rempli avant funding -> MISS
+# - allow_midcycle_topn_switch : ne pas switcher de paire en plein turbo
+# ============================================
+turbo:
+  enabled: true
+  trigger_seconds: 8000     # seuil d'entrée en turbo (t <= 5000s)
+  entry_seconds: 60            # placement de l'ordre à t = 60s
+  refresh_ms: 1000             # rafraîchissement turbo (ms)
+  max_parallel_pairs: 2        # nombre max de paires en turbo en parallèle
+  tick_logging: false          # logs à chaque tick turbo
+  cooldown_s: 120              # délai avant rééligibilité après funding/sortie
+  cancel_on_filter_break: true # annuler ordre / fermer si filtre casse
+  miss_order_timeout_s: 10     # ordre pas rempli avant funding -> MISS
+  allow_midcycle_topn_switch: false # ne pas switcher de paire en plein turbo
+  ws_timeout_seconds: 30       # timeout pour l'attente des données WebSocket
+
+# ============================================
+# Configuration des positions (FR)
+# - leverage : effet de levier des positions
+# - capital_fraction : fraction du capital à utiliser
+# - post_only : ordres post-only uniquement
+# - close_at_funding : fermer les positions au funding
+# - reduce_only_on_exit : ordres de sortie en reduce-only
+# - exit_order_type : type d'ordre de sortie
+# - price_policy : politique de prix pour les ordres
+# - maker_offset_bps : offset en basis points si besoin
+# - min_notional_usd : montant minimum en USD
+# ============================================
+positions:
+  leverage: 1
+  capital_fraction: 0.2
+  post_only: true
+  close_at_funding: true
+  reduce_only_on_exit: true
+  exit_order_type: "limit_post_only"   # "market" ou "limit_post_only"
+  price_policy: "best_bid"             # "best_bid" | "best_ask" | "mid"
+  maker_offset_bps: 0                  # offset en basis points si besoin
+  min_notional_usd: 10
+
+# ============================================
+# Configuration du risque (FR)
+# - max_open_positions : nombre maximum de positions ouvertes
+# - max_trades_per_day : nombre maximum de trades par jour
+# ============================================
+risk:
+  max_open_positions: 1
+  max_trades_per_day: 50
